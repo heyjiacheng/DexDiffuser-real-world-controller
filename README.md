@@ -21,23 +21,28 @@ Published in: IEEE Robotics and Automation Letters ( Volume: 9, Issue: 12, Decem
 1. Create a conda environment
 
 ```
-conda create -n dexdiff python=3.9
+conda create -n dexdiff python=3.8
 conda activate dexdiff
 ```
 
-2. Install [pytorch3d](https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md)
-3. Install [bps_torch](https://github.com/otaheri/bps_torch)
-4. Install dependencies
+2. Install CUDA 11.7
+
+3. Install [pytorch3d](https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md)
+4. Install [bps_torch](https://github.com/otaheri/bps_torch)
+5. Install dependencies
 ```
 pip install omegaconf einops urdf-parser-py hydra-core loguru plotly tqdm transformations trimesh matplotlib pyrender tensorboard tqdm transforms3d
 ```
-5. (optional) Install [IsaacGym](https://developer.nvidia.com/isaac-gym)
+6. (optional) Install [IsaacGym](https://developer.nvidia.com/isaac-gym)
 
 ## Checkpoints & Data
 [Checkoints for sampler and evaluator](https://drive.google.com/drive/folders/1nadKssm-HZA-c3RRlJKAPQnWzEwbGPU-?usp=sharing)
 
+Place the weights in the `ckpts` folder
+
 [Training data](https://drive.google.com/drive/folders/1pAfkVYeYUWfKs8TEAoppScO3IoHcYQML?usp=sharing)
 
+Extract `object.zip` into the `data` folder. Place the `.pickle` file into the `dexdiffuser_data` folder.
 ## Train
 
 Modify the path in config paths so that the model can find the data

@@ -83,7 +83,7 @@ def stability_tester(args: argparse.Namespace) -> dict:
         object_scales = grasps['scale_list']
     else:
         obj_example, grasps_example = next(iter(grasps['sample_qpos'].items()))
-        object_scales = [1. for _ in len(grasps_example)]
+        object_scales = [1. for _ in range(len(grasps_example))]
     
     for object_code in tqdm(list(grasps['sample_qpos'].keys())):
         logger.info(f'Stability test for [{object_code}]')
