@@ -176,8 +176,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Test Scripts of Grasp Generation')
     parser.add_argument('--eval_dir', type=str, required=True,
                         help='evaluation directory path for saving results')
-    parser.add_argument('--ckpt_evaluator', type=str, default='ckpts/10_4_0_evaluator/model_20.pth')
-    parser.add_argument('--data_dir', type=str, default='/proj/berzelius-2023-338/users/x_haolu/dexdiffuser_data')
+    parser.add_argument('--ckpt_evaluator', type=str, default='ckpts/evaluator/model_20.pth')
+    parser.add_argument('--data_dir', type=str, default='dexdiffuser_data')
     parser.add_argument('--seed', type=int, default=42,
                         help='random seed')
     parser.add_argument('--device', type=str, default='cuda',

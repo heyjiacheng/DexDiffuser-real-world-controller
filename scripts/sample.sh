@@ -1,4 +1,4 @@
-MODEL=$1 #['bps', 'pn2']
+MODEL='bps' #['bps', 'pn2']
 
 python sample.py hydra/job_logging=none hydra/hydra_logging=none \
         diffuser=ddpm \

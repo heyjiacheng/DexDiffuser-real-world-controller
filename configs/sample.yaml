@@ -11,11 +11,11 @@ defaults:
   - task: null
 
 dataset_name: multidex # ['multidex', 'dexgraspnet', 'egad']
-data_root: /proj/berzelius-2023-338/users/x_haolu/dexdiffuser_data
+data_root: /home/heyjiacheng/workspace/RA/others/DexDiffuser/dexdiffuser_data
 
-sampler_bps_ckpt_pth: /home/x_haolu/dexclutter/dexdiff_clean/ckpts/bps_sampler/model_200.pth
+sampler_bps_ckpt_pth: /home/heyjiacheng/workspace/RA/others/DexDiffuser/ckpts/sampler/model_200.pth
 sampler_pn2_ckpt_pth: pass
-evaluator_ckpt_pth: /home/x_haolu/dexclutter/dexdiff_clean/ckpts/10_4_0_evaluator/model_20.pth
+evaluator_ckpt_pth: /home/heyjiacheng/workspace/RA/others/DexDiffuser/ckpts/evaluator/model_20.pth
 
 eval_dir: outputs
 exp_name: null

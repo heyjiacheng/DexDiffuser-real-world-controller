@@ -1,5 +1,8 @@
 *pycache*
 .vscode/
 outputs*/
-ckpts/
-data/
+ckpts/*
+data/*
+dexdiffuser_data/*
+pcds/*
+configs/*

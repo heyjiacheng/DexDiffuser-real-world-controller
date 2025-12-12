@@ -17,8 +17,8 @@ dataset:
   normalize_x: true
   normalize_x_trans: false
   urdf_root: ./data/urdf
-  object_root: /proj/berzelius-2023-338/users/x_haolu/dexdiffuser_data
-  data_root: /proj/berzelius-2023-338/users/x_haolu/dexdiffuser_data
+  object_root: /home/heyjiacheng/workspace/RA/others/DexDiffuser/dexdiffuser_data
+  data_root: /home/heyjiacheng/workspace/RA/others/DexDiffuser/dexdiffuser_data
 
 visualizer:
   visualize: false
