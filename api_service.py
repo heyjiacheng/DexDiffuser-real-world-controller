@@ -2,6 +2,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+import base64
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -177,6 +178,32 @@ async def process_grasp(
             pcd = geoms[0]
             pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.0)
 
+            # Save debug files to persistent local directory
+            output_dir = Path("debug_output")
+            output_dir.mkdir(exist_ok=True)
+
+            # Save colored point cloud
+            ply_output_path = output_dir / "object_colored.ply"
+            o3d.io.write_point_cloud(str(ply_output_path), pcd)
+            print(f"Saved colored point cloud to: {ply_output_path}")
+
+            # Save original RGB image
+            import shutil
+            shutil.copy(rgb_path, output_dir / "original_rgb.png")
+
+            # Save depth as visualized image
+            depth_vis = (depth_np / depth_np.max() * 255).astype(np.uint8)
+            cv2.imwrite(str(output_dir / "original_depth.png"), depth_vis)
+
+            # Save segmentation mask and overlay
+            shutil.copy(results["paths"]["mask"], output_dir / "segmentation_mask.png")
+            if "overlay" in results["paths"]:
+                shutil.copy(results["paths"]["overlay"], output_dir / "segmentation_overlay.png")
+
+            # Read .ply file content for sending to client
+            with open(ply_output_path, "rb") as f:
+                ply_content = f.read()
+
             # Extract point cloud as numpy array
             obj_pcd = np.asarray(pcd.points)
             print(f"Object point cloud shape: {obj_pcd.shape}")
@@ -209,12 +236,7 @@ async def process_grasp(
                 best_grasp=grasp_qt[best_grasp_index].tolist(),
                 best_score=float(scores[best_grasp_index]),
                 metadata={
-                    "label": results["label"],
-                    "detection_score": results["score"],
-                    "segmentation_iou": results["iou"],
-                    "mask_area": results["mask_area"],
-                    "point_cloud_size": int(obj_pcd.shape[0]),
-                    "target_objects": target_objects_list
+                    "ply_file_base64": base64.b64encode(ply_content).decode('utf-8')
                 }
             )
 

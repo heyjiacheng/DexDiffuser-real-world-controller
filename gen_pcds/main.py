@@ -76,20 +76,11 @@ def pcd_from_rgbd_cpu(color_img_o3d: o3d.geometry.Image,
     u, v = np.meshgrid(np.arange(W), np.arange(H))
 
     # Debug: print depth statistics
-    print(f"[DEBUG] Depth shape: {z.shape}")
-    print(f"[DEBUG] Depth range: min={np.min(z):.4f}, max={np.max(z):.4f}, mean={np.mean(z):.4f}")
-    print(f"[DEBUG] Non-zero depth pixels: {np.sum(z > 0)}")
-
     valid = (z > 0) & (z < 1)  # tweak as needed (e.g., (z > 0) & (z < max_range))
-    print(f"[DEBUG] Valid depth pixels (0 < z < 1): {np.sum(valid)}")
 
     # Apply mask if provided
     if mask is not None:
-        print(f"[DEBUG] Mask shape: {mask.shape}")
-        print(f"[DEBUG] Mask True pixels: {np.sum(mask)}")
-        print(f"[DEBUG] Mask dtype: {mask.dtype}")
         valid = valid & mask
-        print(f"[DEBUG] Valid pixels after mask: {np.sum(valid)}")
 
     # Back-project
     x = (u - cx) / fx * z
@@ -97,8 +88,6 @@ def pcd_from_rgbd_cpu(color_img_o3d: o3d.geometry.Image,
 
     pts  = np.stack([x[valid], y[valid], z[valid]], axis=1).astype(np.float64)      # Nx3
     cols = (color_np[valid, :3].astype(np.float32) / 255.0).astype(np.float64)      # Nx3
-
-    print(f"[DEBUG] Final point cloud size: {pts.shape[0]}")
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
@@ -227,8 +216,6 @@ def detect_seg_pipeline(
     sam_model_id="facebook/sam-vit-huge",) -> Optional[Dict[str, Any]]:
 
     image_pil = Image.open(image_path).convert("RGB")
-    print(f"Processing image: {image_path}")
-    print(f"Target objects: {target_objects}")
 
     det_dir = ensure_dir(os.path.join(out_root, "detection"))
     seg_dir = ensure_dir(os.path.join(out_root, "segmentation"))
