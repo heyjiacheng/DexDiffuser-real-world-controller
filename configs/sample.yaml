@@ -11,11 +11,11 @@ defaults:
   - task: null
 
 dataset_name: multidex # ['multidex', 'dexgraspnet', 'egad']
-data_root: /home/heyjiacheng/workspace/RA/others/DexDiffuser/dexdiffuser_data
+data_root: dexdiffuser_data
 
-sampler_bps_ckpt_pth: /home/heyjiacheng/workspace/RA/others/DexDiffuser/ckpts/sampler/model_200.pth
+sampler_bps_ckpt_pth: ckpts/sampler/model_200.pth
 sampler_pn2_ckpt_pth: pass
-evaluator_ckpt_pth: /home/heyjiacheng/workspace/RA/others/DexDiffuser/ckpts/evaluator/model_20.pth
+evaluator_ckpt_pth: ckpts/evaluator/model_20.pth
 
 eval_dir: outputs
 exp_name: null

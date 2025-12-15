@@ -1,0 +1,17 @@
+{
+  "label": "tensor(0)",
+  "box": [
+    83.10484313964844,
+    184.36929321289062,
+    474.0458679199219,
+    251.82733154296875
+  ],
+  "score": 0.5511380434036255,
+  "iou": 0.9996554851531982,
+  "mask_area": 13934,
+  "paths": {
+    "detection_viz": "gen_pcds/detection/detected_objects.png",
+    "mask": "gen_pcds/segmentation/mask_tensor(0).png",
+    "overlay": "gen_pcds/segmentation/segmentation_overlay_tensor(0).png"
+  }
+}

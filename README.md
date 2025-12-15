@@ -31,7 +31,7 @@ conda activate dexdiff
 4. Install [bps_torch](https://github.com/otaheri/bps_torch)
 5. Install dependencies
 ```
-pip install omegaconf einops urdf-parser-py hydra-core loguru plotly tqdm transformations trimesh matplotlib pyrender tensorboard tqdm transforms3d
+pip install omegaconf einops urdf-parser-py hydra-core loguru plotly tqdm transformations trimesh matplotlib pyrender tensorboard tqdm transforms3d pytorch-kinematics flask
 ```
 6. (optional) Install [IsaacGym](https://developer.nvidia.com/isaac-gym)
 
@@ -104,3 +104,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for more 
 
 
 
+Use pytorch3d on RTX5080 (first comment)
+```bash
+https://github.com/facebookresearch/pytorch3d/issues/1962
+```
