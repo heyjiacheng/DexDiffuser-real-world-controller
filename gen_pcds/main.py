@@ -74,11 +74,22 @@ def pcd_from_rgbd_cpu(color_img_o3d: o3d.geometry.Image,
 
     # Pixel grid
     u, v = np.meshgrid(np.arange(W), np.arange(H))
+
+    # Debug: print depth statistics
+    print(f"[DEBUG] Depth shape: {z.shape}")
+    print(f"[DEBUG] Depth range: min={np.min(z):.4f}, max={np.max(z):.4f}, mean={np.mean(z):.4f}")
+    print(f"[DEBUG] Non-zero depth pixels: {np.sum(z > 0)}")
+
     valid = (z > 0) & (z < 1)  # tweak as needed (e.g., (z > 0) & (z < max_range))
-    
+    print(f"[DEBUG] Valid depth pixels (0 < z < 1): {np.sum(valid)}")
+
     # Apply mask if provided
     if mask is not None:
+        print(f"[DEBUG] Mask shape: {mask.shape}")
+        print(f"[DEBUG] Mask True pixels: {np.sum(mask)}")
+        print(f"[DEBUG] Mask dtype: {mask.dtype}")
         valid = valid & mask
+        print(f"[DEBUG] Valid pixels after mask: {np.sum(valid)}")
 
     # Back-project
     x = (u - cx) / fx * z
@@ -86,6 +97,8 @@ def pcd_from_rgbd_cpu(color_img_o3d: o3d.geometry.Image,
 
     pts  = np.stack([x[valid], y[valid], z[valid]], axis=1).astype(np.float64)      # Nx3
     cols = (color_np[valid, :3].astype(np.float32) / 255.0).astype(np.float64)      # Nx3
+
+    print(f"[DEBUG] Final point cloud size: {pts.shape[0]}")
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
@@ -296,7 +309,7 @@ if __name__ == "__main__":
         color_img_o3d=color_o3d,
         depth_np=depth_np,
         K=K,
-        depth_unit="m",        # or "mm" if your depth is millimeters
+        depth_unit="mm",        # or "mm" if your depth is millimeters
         flip_for_view=False,   # keep camera-frame alignment so gripper poses match
         add_axis=True,
         axis_size=0.1,
