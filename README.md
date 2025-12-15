@@ -1,3 +1,9 @@
+# Real controller
+```bash
+python api_service.py 
+```
+
+
 # DexDiffuser: Generating Dexterous Grasps with Diffusion Models 
 
 This repository contains the PyTorch implementation of DexDiffuser. 

@@ -208,6 +208,26 @@ async def process_grasp(
             obj_pcd = np.asarray(pcd.points)
             print(f"Object point cloud shape: {obj_pcd.shape}")
 
+            # Debug: Print point cloud statistics
+            print(f"Point cloud statistics BEFORE normalization:")
+            print(f"  - Mean: {obj_pcd.mean(axis=0)}")
+
+            # Convert from mm to meters and normalize
+            obj_pcd = obj_pcd / 1000.0
+
+            # Center the point cloud (move centroid to origin)
+            obj_pcd_center = obj_pcd.mean(axis=0)
+            obj_pcd = obj_pcd - obj_pcd_center
+
+            # Normalize the scale to a reasonable range
+            max_dist = np.sqrt((obj_pcd ** 2).sum(axis=1)).max()
+            if max_dist > 0:
+                # Scale to approximately 0.1m radius (10cm), which is typical for tabletop objects
+                obj_pcd = obj_pcd * (0.1 / max_dist)
+
+            print(f"Point cloud statistics AFTER normalization:")
+            print(f"  - Mean: {obj_pcd.mean(axis=0)}")
+
             # Check if point cloud is empty
             if obj_pcd.shape[0] == 0:
                 raise HTTPException(
