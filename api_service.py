@@ -1,7 +1,7 @@
 import os
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 import base64
 import numpy as np
 import cv2
@@ -16,8 +16,93 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_pcds.main import detect_seg_pipeline, pcd_from_rgbd_cpu
 import open3d as o3d
 from run_real import DexDiffuser, load_config
+from scipy.spatial.transform import Rotation as R
 
 app = FastAPI(title="DexDiffuser Grasp Generation API")
+
+def transform_grasps_to_base_frame(
+    grasp_qt: np.ndarray,
+    obj_center_in_camera: np.ndarray,
+    scale_factor: float,
+    camera_extrinsics: np.ndarray
+) -> np.ndarray:
+    """
+    Transform grasps from normalized object-centered frame to robot base frame.
+
+    Args:
+        grasp_qt: (N, 7+16) array of grasps in format [qw, qx, qy, qz, x, y, z, joint_angles...]
+                  Poses are in normalized object-centered frame
+        obj_center_in_camera: (3,) object center position in camera frame (meters)
+        scale_factor: normalization scale factor applied to point cloud
+        camera_extrinsics: (4, 4) transformation matrix from camera frame to robot base frame
+
+    Returns:
+        grasp_transformed: (N, 7+16) array of grasps in robot base frame
+                          Format: [x, y, z, qw, qx, qy, qz, joint_angles...]
+    """
+    # Extract quaternion and translation
+    quat_wxyz = grasp_qt[:, :4]  # (N, 4) - quaternion in wxyz format
+    trans_normalized = grasp_qt[:, 4:7]  # (N, 3) - translation in normalized object frame
+    joint_angles = grasp_qt[:, 7:]  # (N, 16) - joint angles (unchanged)
+
+    print(f"\n=== Coordinate Transformation Steps (First Grasp) ===")
+    print(f"Input transformation parameters:")
+    print(f"  - obj_center_in_camera (m): {obj_center_in_camera}")
+    print(f"  - scale_factor: {scale_factor}")
+    print(f"  - camera_extrinsics:\n{camera_extrinsics}")
+
+    print(f"\nStep 0: Original normalized grasp")
+    print(f"  - trans_normalized: {trans_normalized[0]}")
+    print(f"  - quat_wxyz: {quat_wxyz[0]}")
+
+    # Step 1: Un-normalize the scale
+    trans_in_obj_frame = trans_normalized / scale_factor  # Back to meters
+    print(f"\nStep 1: Un-normalize scale (/ {scale_factor})")
+    print(f"  - trans_in_obj_frame (m): {trans_in_obj_frame[0]}")
+
+    # Step 2: Transform from object frame to camera frame
+    # Rotation stays the same (object frame and camera frame have same orientation)
+    trans_in_camera = trans_in_obj_frame + obj_center_in_camera[np.newaxis, :]  # (N, 3)
+    print(f"\nStep 2: Transform to camera frame (+ obj_center)")
+    print(f"  - trans_in_camera (m): {trans_in_camera[0]}")
+
+    # Step 3: Transform from camera frame to robot base frame
+    # camera_extrinsics is T_base_camera (4x4 matrix)
+    R_base_camera = camera_extrinsics[:3, :3]  # (3, 3)
+    t_base_camera = camera_extrinsics[:3, 3]   # (3,)
+
+    print(f"\nStep 3: Transform to base frame")
+    print(f"  - R_base_camera:\n{R_base_camera}")
+    print(f"  - t_base_camera: {t_base_camera}")
+
+    # Convert quaternion to rotation matrix
+    rot_scipy = R.from_quat(np.roll(quat_wxyz, -1, axis=1))  # Convert wxyz to xyzw for scipy
+    R_camera_grasp = rot_scipy.as_matrix()  # (N, 3, 3)
+
+    # Transform rotation: R_base_grasp = R_base_camera @ R_camera_grasp
+    R_base_grasp = np.einsum('ij,njk->nik', R_base_camera, R_camera_grasp)  # (N, 3, 3)
+
+    # Transform translation: t_base_grasp = R_base_camera @ t_camera_grasp + t_base_camera
+    trans_in_base = np.einsum('ij,nj->ni', R_base_camera, trans_in_camera) + t_base_camera[np.newaxis, :]
+
+    print(f"  - R_base_camera @ trans_in_camera: {np.dot(R_base_camera, trans_in_camera[0])}")
+    print(f"  - trans_in_base (m): {trans_in_base[0]}")
+    print(f"\nFinal output format: [x, y, z, qw, qx, qy, qz, joint_angles...]")
+    print(f"===================================================\n")
+
+    # Convert back to quaternion
+    rot_scipy_base = R.from_matrix(R_base_grasp)
+    quat_xyzw_base = rot_scipy_base.as_quat()  # (N, 4) in xyzw format
+    quat_wxyz_base = np.roll(quat_xyzw_base, 1, axis=1)  # Convert to wxyz
+
+    # Assemble output in format: [x, y, z, qw, qx, qy, qz, joint_angles...]
+    N = grasp_qt.shape[0]
+    grasp_transformed = np.zeros((N, 23))  # 3 + 4 + 16
+    grasp_transformed[:, 0:3] = trans_in_base      # Position (x, y, z)
+    grasp_transformed[:, 3:7] = quat_wxyz_base     # Quaternion (w, x, y, z)
+    grasp_transformed[:, 7:] = joint_angles        # Joint angles
+
+    return grasp_transformed
 
 # Global DexDiffuser instance (loaded once at startup)
 dex_diffuser = None
@@ -75,7 +160,7 @@ async def process_grasp(
     rgb_image: UploadFile = File(...),
     depth_data: UploadFile = File(...),
     camera_intrinsics: UploadFile = File(...),
-    camera_extrinsics: Optional[UploadFile] = File(None),
+    camera_extrinsics: UploadFile = File(...),
     target_objects: str = Form(...),
     confidence_threshold: float = Form(0.1),
     num_samples: int = Form(32)
@@ -87,13 +172,14 @@ async def process_grasp(
         rgb_image: RGB image file (PNG/JPG)
         depth_data: Depth data as numpy array (.npy file)
         camera_intrinsics: 3x3 camera intrinsic matrix (.npy file)
-        camera_extrinsics: Optional 4x4 camera extrinsic matrix (.npy file)
+        camera_extrinsics: 4x4 camera extrinsic matrix (.npy file) - transformation from camera to robot base
         target_objects: Comma-separated list of target objects
         confidence_threshold: Detection confidence threshold
         num_samples: Number of grasp samples to generate
 
     Returns:
-        GraspResponse with grasp poses and scores
+        GraspResponse with grasp poses in robot base frame and scores
+        Grasp format (23 dims): [x, y, z, qw, qx, qy, qz, joint_angles(16)]
     """
     if dex_diffuser is None:
         raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
@@ -126,12 +212,11 @@ async def process_grasp(
             with open(intrinsics_path, "wb") as f:
                 f.write(intrinsics_content)
 
-            # Save camera extrinsics if provided
-            if camera_extrinsics:
-                extrinsics_path = temp_path / "camera_extrinsics.npy"
-                extrinsics_content = await camera_extrinsics.read()
-                with open(extrinsics_path, "wb") as f:
-                    f.write(extrinsics_content)
+            # Save camera extrinsics
+            extrinsics_path = temp_path / "camera_extrinsics.npy"
+            extrinsics_content = await camera_extrinsics.read()
+            with open(extrinsics_path, "wb") as f:
+                f.write(extrinsics_content)
 
             # Step 1: Detection and Segmentation
             print("Running detection and segmentation...")
@@ -212,21 +297,26 @@ async def process_grasp(
             print(f"Point cloud statistics BEFORE normalization:")
             print(f"  - Mean: {obj_pcd.mean(axis=0)}")
 
-            # Convert from mm to meters and normalize
-            obj_pcd = obj_pcd / 1000.0
+            # NOTE: pcd_from_rgbd_cpu already returns point cloud in meters
+            # No need to convert from mm to meters
 
             # Center the point cloud (move centroid to origin)
-            obj_pcd_center = obj_pcd.mean(axis=0)
-            obj_pcd = obj_pcd - obj_pcd_center
+            # IMPORTANT: Save this for later coordinate transformation
+            obj_pcd_center_in_camera = obj_pcd.mean(axis=0)  # Object center in camera frame (meters)
+            obj_pcd = obj_pcd - obj_pcd_center_in_camera
 
             # Normalize the scale to a reasonable range
             max_dist = np.sqrt((obj_pcd ** 2).sum(axis=1)).max()
+            scale_factor = 1.0
             if max_dist > 0:
                 # Scale to approximately 0.1m radius (10cm), which is typical for tabletop objects
-                obj_pcd = obj_pcd * (0.1 / max_dist)
+                scale_factor = 0.1 / max_dist
+                obj_pcd = obj_pcd * scale_factor
 
             print(f"Point cloud statistics AFTER normalization:")
             print(f"  - Mean: {obj_pcd.mean(axis=0)}")
+            print(f"  - Scale factor: {scale_factor}")
+            print(f"  - Object center in camera frame: {obj_pcd_center_in_camera}")
 
             # Check if point cloud is empty
             if obj_pcd.shape[0] == 0:
@@ -236,8 +326,7 @@ async def process_grasp(
                         "Generated point cloud is empty. This could be due to:\n"
                         "1. Depth values are outside the valid range (0 < depth < 1 meter)\n"
                         "2. Segmentation mask doesn't overlap with valid depth pixels\n"
-                        "3. Depth data is invalid or all zeros\n"
-                        "Check the debug logs above for more details."
+                        "3. Depth data is invalid or all zeros"
                     )
                 )
 
@@ -245,15 +334,33 @@ async def process_grasp(
             print("Generating grasps...")
             grasp_qt, scores = dex_diffuser.sample_grasps(obj_pcd, num_samples=num_samples)
 
+            # Step 3: Transform grasps to robot base frame
+            print("Transforming grasps to robot base frame...")
+            camera_extrinsics_matrix = np.load(extrinsics_path)
+            grasp_qt_base = transform_grasps_to_base_frame(
+                grasp_qt=grasp_qt,
+                obj_center_in_camera=obj_pcd_center_in_camera,
+                scale_factor=scale_factor,
+                camera_extrinsics=camera_extrinsics_matrix
+            )
+
             # Find best grasp
             best_grasp_index = int(np.argmax(scores))
 
-            # Prepare response
+            print(f"\n=== Best Grasp Selected ===")
+            print(f"Best grasp index: {best_grasp_index}")
+            print(f"Best score: {scores[best_grasp_index]:.4f}")
+            print(f"Best grasp (23 dims): [x, y, z, qw, qx, qy, qz, joints...]")
+            print(f"  Position (x,y,z): {grasp_qt_base[best_grasp_index, 0:3]}")
+            print(f"  Quaternion (w,x,y,z): {grasp_qt_base[best_grasp_index, 3:7]}")
+            print(f"===========================\n")
+
+            # Prepare response (using transformed grasps in robot base frame)
             response = GraspResponse(
-                grasp_qt=grasp_qt.tolist(),
+                grasp_qt=grasp_qt_base.tolist(),
                 scores=scores.tolist(),
                 best_grasp_index=best_grasp_index,
-                best_grasp=grasp_qt[best_grasp_index].tolist(),
+                best_grasp=grasp_qt_base[best_grasp_index].tolist(),
                 best_score=float(scores[best_grasp_index]),
                 metadata={
                     "ply_file_base64": base64.b64encode(ply_content).decode('utf-8')
