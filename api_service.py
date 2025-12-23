@@ -17,6 +17,8 @@ from gen_pcds.main import detect_seg_pipeline, pcd_from_rgbd_cpu
 import open3d as o3d
 from run_real import DexDiffuser, load_config
 from scipy.spatial.transform import Rotation as R
+from visualize_camera_view import visualize_from_camera_view
+import threading
 
 app = FastAPI(title="DexDiffuser Grasp Generation API")
 
@@ -38,7 +40,7 @@ def transform_grasps_to_base_frame(
 
     Returns:
         grasp_transformed: (N, 7+16) array of grasps in robot base frame
-                          Format: [x, y, z, qw, qx, qy, qz, joint_angles...]
+                          Format: [qw, qx, qy, qz, x, y, z, joint_angles...]
     """
     # Extract quaternion and translation
     quat_wxyz = grasp_qt[:, :4]  # (N, 4) - quaternion in wxyz format
@@ -87,7 +89,7 @@ def transform_grasps_to_base_frame(
 
     print(f"  - R_base_camera @ trans_in_camera: {np.dot(R_base_camera, trans_in_camera[0])}")
     print(f"  - trans_in_base (m): {trans_in_base[0]}")
-    print(f"\nFinal output format: [x, y, z, qw, qx, qy, qz, joint_angles...]")
+    print(f"\nFinal output format: [qw, qx, qy, qz, x, y, z, joint_angles...]")
     print(f"===================================================\n")
 
     # Convert back to quaternion
@@ -95,11 +97,11 @@ def transform_grasps_to_base_frame(
     quat_xyzw_base = rot_scipy_base.as_quat()  # (N, 4) in xyzw format
     quat_wxyz_base = np.roll(quat_xyzw_base, 1, axis=1)  # Convert to wxyz
 
-    # Assemble output in format: [x, y, z, qw, qx, qy, qz, joint_angles...]
+    # Assemble output in format: [qw, qx, qy, qz, x, y, z, joint_angles...]
     N = grasp_qt.shape[0]
-    grasp_transformed = np.zeros((N, 23))  # 3 + 4 + 16
-    grasp_transformed[:, 0:3] = trans_in_base      # Position (x, y, z)
-    grasp_transformed[:, 3:7] = quat_wxyz_base     # Quaternion (w, x, y, z)
+    grasp_transformed = np.zeros((N, 23))  # 4 + 3 + 16
+    grasp_transformed[:, 0:4] = quat_wxyz_base     # Quaternion (w, x, y, z)
+    grasp_transformed[:, 4:7] = trans_in_base      # Position (x, y, z)
     grasp_transformed[:, 7:] = joint_angles        # Joint angles
 
     return grasp_transformed
@@ -179,7 +181,7 @@ async def process_grasp(
 
     Returns:
         GraspResponse with grasp poses in robot base frame and scores
-        Grasp format (23 dims): [x, y, z, qw, qx, qy, qz, joint_angles(16)]
+        Grasp format (23 dims): [qw, qx, qy, qz, x, y, z, joint_angles(16)]
     """
     if dex_diffuser is None:
         raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
@@ -263,6 +265,21 @@ async def process_grasp(
             pcd = geoms[0]
             pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.0)
 
+            # Extract point cloud as numpy array
+            obj_pcd = np.asarray(pcd.points)
+
+            # --- 添加此检查 ---
+            # 检查单位是否为米。如果最大值超过 10.0 (通常桌上物体不会超过10米)，则可能是毫米
+            max_val = np.max(np.abs(obj_pcd))
+            print(f"DEBUG: Point Cloud Max Coord Value: {max_val}")
+            if max_val > 5.0:
+                print("WARNING: Point cloud values suggest unit is MM. Converting to Meters.")
+                obj_pcd = obj_pcd / 1000.0
+            # ----------------
+
+            # Save original point cloud in camera frame for visualization (before centering)
+            obj_pcd_in_camera_frame = obj_pcd.copy()
+
             # Save debug files to persistent local directory
             output_dir = Path("debug_output")
             output_dir.mkdir(exist_ok=True)
@@ -305,18 +322,14 @@ async def process_grasp(
             obj_pcd_center_in_camera = obj_pcd.mean(axis=0)  # Object center in camera frame (meters)
             obj_pcd = obj_pcd - obj_pcd_center_in_camera
 
-            # Normalize the scale to a reasonable range
-            max_dist = np.sqrt((obj_pcd ** 2).sum(axis=1)).max()
-            scale_factor = 1.0
-            if max_dist > 0:
-                # Scale to approximately 0.1m radius (10cm), which is typical for tabletop objects
-                scale_factor = 0.1 / max_dist
-                obj_pcd = obj_pcd * scale_factor
+            # Keep original scale (no normalization)
+            scale_factor = 1.0  # No scaling applied
 
-            print(f"Point cloud statistics AFTER normalization:")
+            print(f"Point cloud statistics AFTER centering (no scale normalization):")
             print(f"  - Mean: {obj_pcd.mean(axis=0)}")
             print(f"  - Scale factor: {scale_factor}")
             print(f"  - Object center in camera frame: {obj_pcd_center_in_camera}")
+            print(f"  - Max distance from center: {np.sqrt((obj_pcd ** 2).sum(axis=1)).max()}")
 
             # Check if point cloud is empty
             if obj_pcd.shape[0] == 0:
@@ -350,10 +363,15 @@ async def process_grasp(
             print(f"\n=== Best Grasp Selected ===")
             print(f"Best grasp index: {best_grasp_index}")
             print(f"Best score: {scores[best_grasp_index]:.4f}")
-            print(f"Best grasp (23 dims): [x, y, z, qw, qx, qy, qz, joints...]")
-            print(f"  Position (x,y,z): {grasp_qt_base[best_grasp_index, 0:3]}")
-            print(f"  Quaternion (w,x,y,z): {grasp_qt_base[best_grasp_index, 3:7]}")
+            print(f"Best grasp (23 dims): [qw, qx, qy, qz, x, y, z, joints...]")
+            print(f"  Quaternion (w,x,y,z): {grasp_qt_base[best_grasp_index, 0:4]}")
+            print(f"  Position (x,y,z): {grasp_qt_base[best_grasp_index, 4:7]}")
             print(f"===========================\n")
+
+            # Save additional debug files for visualization
+            np.save(output_dir / "camera_extrinsics.npy", camera_extrinsics_matrix)
+            np.save(output_dir / "best_grasp_base.npy", grasp_qt_base[best_grasp_index])
+            print(f"Saved camera_extrinsics.npy and best_grasp_base.npy to {output_dir}/")
 
             # Prepare response (using transformed grasps in robot base frame)
             response = GraspResponse(
@@ -368,6 +386,27 @@ async def process_grasp(
             )
 
             print("Grasp generation completed successfully!")
+
+            # Launch visualization in background thread (non-blocking)
+            def run_visualization():
+                try:
+                    print("\n" + "="*60)
+                    print("Starting visualization in background...")
+                    print("="*60)
+                    visualize_from_camera_view(
+                        obj_pcd_in_camera=obj_pcd_in_camera_frame,
+                        grasp_in_base=grasp_qt_base[best_grasp_index],
+                        camera_extrinsics=camera_extrinsics_matrix,
+                        robot='allegro_right'
+                    )
+                except Exception as e:
+                    print(f"Visualization error: {e}")
+
+            # Start visualization in background thread
+            viz_thread = threading.Thread(target=run_visualization, daemon=True)
+            viz_thread.start()
+            print("Visualization launched in background thread")
+
             return response
 
         except HTTPException:
