@@ -1,7 +1,24 @@
-# Real controller
+# DexDiffuser API Service
+
+FastAPI service for real-time dexterous grasp generation.
+
+## Quick Start
 ```bash
-python api_service.py 
+python api_service.py
 ```
+Server runs on `http://0.0.0.0:8000`
+
+## API Endpoints
+
+**POST /process_grasp** - Generate grasps from RGB-D images
+- Input: RGB image, depth (.npy), camera intrinsics (3x3), camera extrinsics (4x4), target objects
+- Output: Grasp poses in robot base frame `[qw, qx, qy, qz, x, y, z, joint_angles(16)]`
+
+**POST /process_pcd** - Generate grasps from point cloud
+- Input: Point cloud (.pt), camera extrinsics (4x4)
+- Output: Grasp poses in robot base frame
+
+**GET /health** - Check service status
 
 
 # DexDiffuser: Generating Dexterous Grasps with Diffusion Models 

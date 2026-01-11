@@ -13,6 +13,9 @@ from plotly import graph_objects as go
 from scipy.spatial.transform import Rotation as R
 from utils.handmodel import get_handmodel
 from utils.rot6d import robust_compute_rotation_matrix_from_ortho6d
+from dash import Dash, dcc, html, Input, Output
+import webbrowser
+from threading import Timer
 
 
 def plot_point_cloud(pts, color='lightblue', mode='markers', name='Point Cloud'):
@@ -321,6 +324,186 @@ def test_with_synthetic_data():
         camera_extrinsics=camera_extrinsics,
         robot='allegro_right'
     )
+
+
+def visualize_grasps_interactive(
+    obj_pcd_in_camera,
+    all_grasps_base,
+    all_scores,
+    camera_extrinsics,
+    robot='allegro_right',
+    port=8050
+):
+    """
+    交互式可视化所有抓取姿态（支持滑块选择）
+
+    Args:
+        obj_pcd_in_camera: (N, 3) 物体点云,在相机坐标系中 (米)
+        all_grasps_base: (M, 23) 所有抓取姿态,在基坐标系中 [qw,qx,qy,qz,x,y,z,joints(16)]
+        all_scores: (M,) 所有抓取的评分
+        camera_extrinsics: (4, 4) 相机外参矩阵 T_base_camera
+        robot: 机器人类型
+        port: Dash 应用端口
+    """
+    print("="*60)
+    print("启动交互式可视化...")
+    print(f"总共 {len(all_grasps_base)} 个抓取姿态")
+    print("="*60)
+
+    # 按 score 降序排序
+    sorted_indices = np.argsort(all_scores)[::-1]
+    sorted_grasps = all_grasps_base[sorted_indices]
+    sorted_scores = all_scores[sorted_indices]
+
+    print(f"Score 范围: {sorted_scores.min():.4f} ~ {sorted_scores.max():.4f}")
+    print(f"Top 5 scores: {sorted_scores[:5]}")
+
+    # 提取坐标转换参数
+    R_base_camera = camera_extrinsics[:3, :3]
+    t_base_camera = camera_extrinsics[:3, 3]
+
+    # 将物体点云转换到基坐标系
+    obj_pcd_base = (R_base_camera @ obj_pcd_in_camera.T).T + t_base_camera
+
+    # 创建手部模型（只创建一次，后续更新运动学）
+    hand_model = get_handmodel(batch_size=1, device='cuda',
+                               urdf_path='data/urdf',
+                               robot=robot)
+
+    def create_figure(grasp_index):
+        """根据选中的 grasp index 创建图形"""
+        grasp_in_base = sorted_grasps[grasp_index]
+        score = sorted_scores[grasp_index]
+        original_index = sorted_indices[grasp_index]
+
+        # 解析抓取姿态
+        quat_base = grasp_in_base[:4]  # wxyz
+        trans_base = grasp_in_base[4:7]
+        joint_angles = grasp_in_base[7:23]
+
+        # 转换为旋转矩阵
+        rot_scipy = R.from_quat(np.roll(quat_base, -1))  # wxyz -> xyzw
+        R_base_hand = rot_scipy.as_matrix()
+
+        # 转换为 rot6d
+        rot6d_base = R_base_hand.T[:2].reshape([6])
+
+        # 构建 q_tr
+        q_tr = np.concatenate([trans_base, rot6d_base, joint_angles])
+        q_tr_torch = torch.from_numpy(q_tr).unsqueeze(0).float().to('cuda')
+
+        # 更新手部运动学
+        hand_model.update_kinematics(q=q_tr_torch)
+
+        # 创建可视化数据
+        vis_data = []
+
+        # 添加物体点云
+        vis_data.append(plot_point_cloud(obj_pcd_base, color='pink', name='Object Point Cloud'))
+
+        # 添加手部模型
+        hand_plotly_data = hand_model.get_plotly_data(opacity=0.5, color='lightblue')
+        vis_data.extend(hand_plotly_data)
+
+        # 添加基坐标系
+        base_frame_traces = plot_coordinate_frame(
+            origin=np.array([0, 0, 0]),
+            rotation_matrix=np.eye(3),
+            scale=0.15,
+            name_prefix='Base'
+        )
+        vis_data.extend(base_frame_traces)
+
+        # 添加相机坐标系
+        camera_frame_traces = plot_coordinate_frame(
+            origin=t_base_camera,
+            rotation_matrix=R_base_camera,
+            scale=0.15,
+            name_prefix='Camera'
+        )
+        vis_data.extend(camera_frame_traces)
+
+        # 创建图形
+        fig = go.Figure(data=vis_data)
+
+        # 设置布局
+        fig.update_layout(
+            scene=dict(
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5),
+                    center=dict(x=0, y=0, z=0.3),
+                    up=dict(x=0, y=0, z=1)
+                ),
+                xaxis_title='X (m)',
+                yaxis_title='Y (m)',
+                zaxis_title='Z (m)',
+                aspectmode='data'
+            ),
+            title=f'抓取姿态 #{grasp_index+1} (原始索引: {original_index}) | Score: {score:.4f}',
+            showlegend=True,
+            height=800
+        )
+
+        return fig
+
+    # 创建 Dash 应用
+    app = Dash(__name__)
+
+    app.layout = html.Div([
+        html.Div([
+            dcc.Slider(
+                id='grasp-slider',
+                min=0,
+                max=len(sorted_grasps) - 1,
+                value=0,
+                marks={i: f'{i+1}' for i in range(0, len(sorted_grasps), max(1, len(sorted_grasps) // 10))},
+                step=1,
+                tooltip={"placement": "bottom", "always_visible": True}
+            )
+        ], style={
+            'margin': '5px 10px 0px 10px',
+            'padding': '5px'
+        }),
+
+        html.Div(id='grasp-info', style={'display': 'none'}),
+
+        dcc.Graph(id='grasp-visualization', style={
+            'height': '95vh',
+            'margin': '0'
+        })
+    ], style={
+        'margin': '0',
+        'padding': '0',
+        'overflow': 'hidden'
+    })
+
+    @app.callback(
+        [Output('grasp-visualization', 'figure'),
+         Output('grasp-info', 'children')],
+        [Input('grasp-slider', 'value')]
+    )
+    def update_visualization(grasp_index):
+        fig = create_figure(grasp_index)
+        score = sorted_scores[grasp_index]
+        original_index = sorted_indices[grasp_index]
+
+        info_text = f"当前显示: 第 {grasp_index+1}/{len(sorted_grasps)} 个抓取 | " \
+                    f"原始索引: {original_index} | Score: {score:.4f}"
+
+        return fig, info_text
+
+    # 自动打开浏览器
+    def open_browser():
+        webbrowser.open_new(f'http://127.0.0.1:{port}/')
+
+    Timer(1, open_browser).start()
+
+    print(f"\n启动 Dash 应用在 http://127.0.0.1:{port}/")
+    print("提示: 使用滑块选择不同的抓取姿态")
+    print("按 Ctrl+C 停止服务器\n")
+
+    # 运行应用 (使用新的 app.run() 方法)
+    app.run(debug=False, port=port, host='127.0.0.1')
 
 
 if __name__ == "__main__":

@@ -276,7 +276,8 @@ class DexDiffuser:
 
         # highest_score_grasp = grasp_qt[max_score_index]
 
-        self.visualize_func(outputs[max_score_index:max_score_index+1],  obj_pcd_torch[0].detach().cpu(),'allegro_right')
+        # Visualization is handled by api_service_new.py with interactive viewer
+        # self.visualize_func(outputs[max_score_index:max_score_index+1],  obj_pcd_torch[0].detach().cpu(),'allegro_right')
 
         return grasp_qt, score # qt representation wxyz, xyz
 

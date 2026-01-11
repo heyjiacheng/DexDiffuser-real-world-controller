@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 import os
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Any
+from contextlib import asynccontextmanager
 import base64
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 import uvicorn
+import torch
 
 # Import functions from existing modules
 import sys
@@ -17,10 +21,257 @@ from gen_pcds.main import detect_seg_pipeline, pcd_from_rgbd_cpu
 import open3d as o3d
 from run_real import DexDiffuser, load_config
 from scipy.spatial.transform import Rotation as R
-from visualize_camera_view import visualize_from_camera_view
+from visualize_camera_view import visualize_grasps_interactive
 import threading
 
-app = FastAPI(title="DexDiffuser Grasp Generation API")
+
+# Global DexDiffuser instance (loaded once at startup)
+dex_diffuser = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown."""
+    # Startup: Initialize DexDiffuser model
+    global dex_diffuser
+    try:
+        config_path = "configs/sample.yaml"
+        cfg = load_config(config_path)
+        cfg.model = load_config("configs/model/unet_grasp_bps.yaml")
+        cfg.diffuser = load_config("configs/diffuser/ddpm.yaml")
+        cfg.task = load_config("configs/task/grasp_gen_ur_dexgn_slurm.yaml")
+        cfg.refinement = True
+
+        dex_diffuser = DexDiffuser(cfg)
+        print("DexDiffuser model loaded successfully!")
+    except Exception as e:
+        print(f"Warning: Could not load DexDiffuser model: {e}")
+        print("Service will start but grasp generation may fail")
+
+    yield
+
+    # Shutdown: cleanup if needed
+    print("Shutting down...")
+
+
+app = FastAPI(
+    title="DexDiffuser Grasp Generation API",
+    lifespan=lifespan
+)
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Point cloud processing
+UNIT_CONVERSION_THRESHOLD = 5.0  # If max coord > this, assume mm instead of meters
+MM_TO_M_SCALE = 1000.0
+
+# Statistical outlier removal
+OUTLIER_NB_NEIGHBORS_RGBD = 100
+OUTLIER_STD_RATIO_RGBD = 2.0
+OUTLIER_NB_NEIGHBORS_PCD = 20
+OUTLIER_STD_RATIO_PCD = 2.0
+
+# Plane segmentation
+PLANE_DISTANCE_THRESHOLD = 0.005  # meters
+PLANE_RANSAC_N = 3
+PLANE_NUM_ITERATIONS = 1000
+
+# Point cloud downsampling
+VOXEL_SIZE = 0.005  # meters
+
+# Visualization
+VIZ_PORT = 8050
+ROBOT_TYPE = 'allegro_right'
+
+# Debug output
+DEBUG_OUTPUT_DIR = "debug_output"
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def process_point_cloud(
+    obj_pcd: np.ndarray,
+    output_dir: Path,
+    pcd_o3d: o3d.geometry.PointCloud = None
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """
+    Process point cloud: check units, center, and save debug info.
+
+    Args:
+        obj_pcd: (N, 3) point cloud array
+        output_dir: Directory to save debug files
+        pcd_o3d: Optional Open3D point cloud for saving colored version
+
+    Returns:
+        Tuple of (processed_pcd, original_pcd_copy, obj_center, scale_factor)
+    """
+    # Check and convert units if necessary (mm to meters)
+    max_val = np.max(np.abs(obj_pcd))
+    print(f"Point Cloud Max Coord Value: {max_val}")
+    if max_val > UNIT_CONVERSION_THRESHOLD:
+        print("WARNING: Point cloud values suggest unit is MM. Converting to Meters.")
+        obj_pcd = obj_pcd / MM_TO_M_SCALE
+
+    # Save original point cloud for visualization (before centering)
+    obj_pcd_in_camera_frame = obj_pcd.copy()
+
+    # Save colored point cloud if provided
+    if pcd_o3d is not None:
+        ply_output_path = output_dir / "object_colored.ply"
+        o3d.io.write_point_cloud(str(ply_output_path), pcd_o3d)
+        print(f"Saved colored point cloud to: {ply_output_path}")
+
+    # Print statistics before centering
+    print(f"Point cloud statistics BEFORE normalization:")
+    print(f"  - Mean: {obj_pcd.mean(axis=0)}")
+
+    # Center the point cloud
+    obj_pcd_center_in_camera = obj_pcd.mean(axis=0)
+    obj_pcd_centered = obj_pcd - obj_pcd_center_in_camera
+
+    # No scaling applied
+    scale_factor = 1.0
+
+    print(f"Point cloud statistics AFTER centering (no scale normalization):")
+    print(f"  - Mean: {obj_pcd_centered.mean(axis=0)}")
+    print(f"  - Scale factor: {scale_factor}")
+    print(f"  - Object center in camera frame: {obj_pcd_center_in_camera}")
+    print(f"  - Max distance from center: {np.sqrt((obj_pcd_centered ** 2).sum(axis=1)).max()}")
+
+    return obj_pcd_centered, obj_pcd_in_camera_frame, obj_pcd_center_in_camera, scale_factor
+
+
+def save_debug_files(
+    output_dir: Path,
+    camera_extrinsics: np.ndarray,
+    best_grasp: np.ndarray,
+    rgb_path: Path = None,
+    depth_np: np.ndarray = None,
+    mask_path: Path = None,
+    overlay_path: Path = None
+) -> None:
+    """Save debug files to output directory."""
+    output_dir.mkdir(exist_ok=True)
+
+    # Save camera extrinsics and best grasp
+    np.save(output_dir / "camera_extrinsics.npy", camera_extrinsics)
+    np.save(output_dir / "best_grasp_base.npy", best_grasp)
+
+    # Save RGB image if provided
+    if rgb_path is not None and rgb_path.exists():
+        import shutil
+        shutil.copy(rgb_path, output_dir / "original_rgb.png")
+
+    # Save depth visualization if provided
+    if depth_np is not None:
+        depth_vis = (depth_np / depth_np.max() * 255).astype(np.uint8)
+        cv2.imwrite(str(output_dir / "original_depth.png"), depth_vis)
+
+    # Save segmentation files if provided
+    if mask_path is not None and mask_path.exists():
+        import shutil
+        shutil.copy(mask_path, output_dir / "segmentation_mask.png")
+
+    if overlay_path is not None and overlay_path.exists():
+        import shutil
+        shutil.copy(overlay_path, output_dir / "segmentation_overlay.png")
+
+    print(f"Saved debug files to {output_dir}/")
+
+
+def generate_and_transform_grasps(
+    obj_pcd_centered: np.ndarray,
+    obj_center_in_camera: np.ndarray,
+    scale_factor: float,
+    camera_extrinsics: np.ndarray,
+    num_samples: int,
+    dex_diffuser_model
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Generate grasps and transform to base frame.
+
+    Returns:
+        Tuple of (grasps_in_base, scores, best_grasp_index)
+    """
+    print("Generating grasps...")
+    grasp_qt, scores = dex_diffuser_model.sample_grasps(obj_pcd_centered, num_samples=num_samples)
+
+    print("Transforming grasps to robot base frame...")
+    grasp_qt_base = transform_grasps_to_base_frame(
+        grasp_qt=grasp_qt,
+        obj_center_in_camera=obj_center_in_camera,
+        scale_factor=scale_factor,
+        camera_extrinsics=camera_extrinsics
+    )
+
+    best_grasp_index = int(np.argmax(scores))
+
+    print(f"\n=== Best Grasp Selected ===")
+    print(f"Best grasp index: {best_grasp_index}")
+    print(f"Best score: {scores[best_grasp_index]:.4f}")
+    print(f"Best grasp (23 dims): [qw, qx, qy, qz, x, y, z, joints...]")
+    print(f"  Quaternion (w,x,y,z): {grasp_qt_base[best_grasp_index, 0:4]}")
+    print(f"  Position (x,y,z): {grasp_qt_base[best_grasp_index, 4:7]}")
+    print(f"===========================\n")
+
+    return grasp_qt_base, scores, best_grasp_index
+
+
+def launch_visualization(
+    obj_pcd_in_camera: np.ndarray,
+    grasps_base: np.ndarray,
+    scores: np.ndarray,
+    camera_extrinsics: np.ndarray,
+    robot: str = ROBOT_TYPE,
+    port: int = VIZ_PORT
+) -> None:
+    """Launch interactive visualization in background thread."""
+    def run_visualization():
+        try:
+            print("\n" + "="*60)
+            print("Starting interactive visualization in background...")
+            print("="*60)
+            visualize_grasps_interactive(
+                obj_pcd_in_camera=obj_pcd_in_camera,
+                all_grasps_base=grasps_base,
+                all_scores=scores,
+                camera_extrinsics=camera_extrinsics,
+                robot=robot,
+                port=port
+            )
+        except Exception as e:
+            print(f"Visualization error: {e}")
+
+    viz_thread = threading.Thread(target=run_visualization, daemon=True)
+    viz_thread.start()
+    print(f"Interactive visualization launched at http://127.0.0.1:{port}")
+
+
+def create_grasp_response(
+    grasps_base: np.ndarray,
+    scores: np.ndarray,
+    best_grasp_index: int,
+    ply_path: Path
+) -> GraspResponse:
+    """Create API response with grasp data."""
+    with open(ply_path, "rb") as f:
+        ply_content = f.read()
+
+    return GraspResponse(
+        grasp_qt=grasps_base.tolist(),
+        scores=scores.tolist(),
+        best_grasp_index=best_grasp_index,
+        best_grasp=grasps_base[best_grasp_index].tolist(),
+        best_score=float(scores[best_grasp_index]),
+        metadata={
+            "ply_file_base64": base64.b64encode(ply_content).decode('utf-8')
+        }
+    )
+
 
 def transform_grasps_to_base_frame(
     grasp_qt: np.ndarray,
@@ -106,8 +357,10 @@ def transform_grasps_to_base_frame(
 
     return grasp_transformed
 
-# Global DexDiffuser instance (loaded once at startup)
-dex_diffuser = None
+
+# ============================================================================
+# Request/Response Models
+# ============================================================================
 
 class GraspRequest(BaseModel):
     target_objects: List[str]
@@ -122,30 +375,18 @@ class GraspResponse(BaseModel):
     best_score: float
     metadata: Dict[str, Any]
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize DexDiffuser model on startup"""
-    global dex_diffuser
-    try:
-        config_path = "configs/sample.yaml"
-        cfg = load_config(config_path)
-        cfg.model = load_config("configs/model/unet_grasp_bps.yaml")
-        cfg.diffuser = load_config("configs/diffuser/ddpm.yaml")
-        cfg.task = load_config("configs/task/grasp_gen_ur_dexgn_slurm.yaml")
-        cfg.refinement = True
 
-        dex_diffuser = DexDiffuser(cfg)
-        print("DexDiffuser model loaded successfully!")
-    except Exception as e:
-        print(f"Warning: Could not load DexDiffuser model: {e}")
-        print("Service will start but grasp generation may fail")
+# ============================================================================
+# FastAPI Application Endpoints
+# ============================================================================
 
 @app.get("/")
 async def root():
     return {
         "message": "DexDiffuser Grasp Generation API",
         "endpoints": {
-            "/process_grasp": "POST - Main endpoint for grasp generation",
+            "/process_grasp": "POST - Main endpoint for grasp generation from RGB-D",
+            "/process_pcd": "POST - Generate grasps directly from point cloud (.pt file)",
             "/health": "GET - Health check"
         }
     }
@@ -186,41 +427,28 @@ async def process_grasp(
     if dex_diffuser is None:
         raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
 
-    # Use temporary directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             temp_path = Path(temp_dir)
-
-            # Parse target objects
             target_objects_list = [obj.strip() for obj in target_objects.split(",")]
 
             # Save uploaded files
             rgb_path = temp_path / "color.png"
             depth_path = temp_path / "depth.npy"
             intrinsics_path = temp_path / "camera_intrinsics.npy"
-
-            # Save RGB image
-            rgb_content = await rgb_image.read()
-            with open(rgb_path, "wb") as f:
-                f.write(rgb_content)
-
-            # Save depth data
-            depth_content = await depth_data.read()
-            with open(depth_path, "wb") as f:
-                f.write(depth_content)
-
-            # Save camera intrinsics
-            intrinsics_content = await camera_intrinsics.read()
-            with open(intrinsics_path, "wb") as f:
-                f.write(intrinsics_content)
-
-            # Save camera extrinsics
             extrinsics_path = temp_path / "camera_extrinsics.npy"
-            extrinsics_content = await camera_extrinsics.read()
-            with open(extrinsics_path, "wb") as f:
-                f.write(extrinsics_content)
 
-            # Step 1: Detection and Segmentation
+            for file, path in [
+                (rgb_image, rgb_path),
+                (depth_data, depth_path),
+                (camera_intrinsics, intrinsics_path),
+                (camera_extrinsics, extrinsics_path)
+            ]:
+                content = await file.read()
+                with open(path, "wb") as f:
+                    f.write(content)
+
+            # Run detection and segmentation
             print("Running detection and segmentation...")
             results = detect_seg_pipeline(
                 image_path=str(rgb_path),
@@ -235,101 +463,29 @@ async def process_grasp(
                     detail="No objects detected. Try lowering confidence_threshold or checking target_objects."
                 )
 
-            # Load mask and generate point cloud
-            mask_path = results["paths"]["mask"]
-            mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED).astype(bool)
-
-            # Load RGB, depth, and intrinsics
-            # 注意：Open3D 读取进来的是 RGB 格式。
-            # 如果后续要用 cv2 处理或保存，必须先转换成 BGR：
-            # cv2_img = cv2.cvtColor(np.asarray(color_o3d), cv2.COLOR_RGB2BGR)
-
+            # Generate point cloud from RGB-D and mask
+            print("Generating point cloud...")
+            mask = cv2.imread(results["paths"]["mask"], cv2.IMREAD_UNCHANGED).astype(bool)
             color_o3d = o3d.io.read_image(str(rgb_path))
             depth_np = np.load(depth_path)
             K = np.load(intrinsics_path)
 
-            # Generate point cloud with mask
-            print("Generating point cloud...")
             geoms = pcd_from_rgbd_cpu(
                 color_img_o3d=color_o3d,
                 depth_np=depth_np,
                 K=K,
-                depth_unit="mm",  # Depth data is in millimeters
+                depth_unit="mm",
                 flip_for_view=False,
                 add_axis=True,
                 axis_size=0.1,
                 mask=mask
             )
 
-            # Remove outliers from point cloud
-            pcd = geoms[0]
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.0)
-
-            # Extract point cloud as numpy array
+            pcd, _ = geoms[0].remove_statistical_outlier(
+                nb_neighbors=OUTLIER_NB_NEIGHBORS_RGBD,
+                std_ratio=OUTLIER_STD_RATIO_RGBD
+            )
             obj_pcd = np.asarray(pcd.points)
-
-            # --- 添加此检查 ---
-            # 检查单位是否为米。如果最大值超过 10.0 (通常桌上物体不会超过10米)，则可能是毫米
-            max_val = np.max(np.abs(obj_pcd))
-            print(f"DEBUG: Point Cloud Max Coord Value: {max_val}")
-            if max_val > 5.0:
-                print("WARNING: Point cloud values suggest unit is MM. Converting to Meters.")
-                obj_pcd = obj_pcd / 1000.0
-            # ----------------
-
-            # Save original point cloud in camera frame for visualization (before centering)
-            obj_pcd_in_camera_frame = obj_pcd.copy()
-
-            # Save debug files to persistent local directory
-            output_dir = Path("debug_output")
-            output_dir.mkdir(exist_ok=True)
-
-            # Save colored point cloud
-            ply_output_path = output_dir / "object_colored.ply"
-            o3d.io.write_point_cloud(str(ply_output_path), pcd)
-            print(f"Saved colored point cloud to: {ply_output_path}")
-
-            # Save original RGB image
-            import shutil
-            shutil.copy(rgb_path, output_dir / "original_rgb.png")
-
-            # Save depth as visualized image
-            depth_vis = (depth_np / depth_np.max() * 255).astype(np.uint8)
-            cv2.imwrite(str(output_dir / "original_depth.png"), depth_vis)
-
-            # Save segmentation mask and overlay
-            shutil.copy(results["paths"]["mask"], output_dir / "segmentation_mask.png")
-            if "overlay" in results["paths"]:
-                shutil.copy(results["paths"]["overlay"], output_dir / "segmentation_overlay.png")
-
-            # Read .ply file content for sending to client
-            with open(ply_output_path, "rb") as f:
-                ply_content = f.read()
-
-            # Extract point cloud as numpy array
-            obj_pcd = np.asarray(pcd.points)
-            print(f"Object point cloud shape: {obj_pcd.shape}")
-
-            # Debug: Print point cloud statistics
-            print(f"Point cloud statistics BEFORE normalization:")
-            print(f"  - Mean: {obj_pcd.mean(axis=0)}")
-
-            # NOTE: pcd_from_rgbd_cpu already returns point cloud in meters
-            # No need to convert from mm to meters
-
-            # Center the point cloud (move centroid to origin)
-            # IMPORTANT: Save this for later coordinate transformation
-            obj_pcd_center_in_camera = obj_pcd.mean(axis=0)  # Object center in camera frame (meters)
-            obj_pcd = obj_pcd - obj_pcd_center_in_camera
-
-            # Keep original scale (no normalization)
-            scale_factor = 1.0  # No scaling applied
-
-            print(f"Point cloud statistics AFTER centering (no scale normalization):")
-            print(f"  - Mean: {obj_pcd.mean(axis=0)}")
-            print(f"  - Scale factor: {scale_factor}")
-            print(f"  - Object center in camera frame: {obj_pcd_center_in_camera}")
-            print(f"  - Max distance from center: {np.sqrt((obj_pcd ** 2).sum(axis=1)).max()}")
 
             # Check if point cloud is empty
             if obj_pcd.shape[0] == 0:
@@ -337,75 +493,147 @@ async def process_grasp(
                     status_code=400,
                     detail=(
                         "Generated point cloud is empty. This could be due to:\n"
-                        "1. Depth values are outside the valid range (0 < depth < 1 meter)\n"
+                        "1. Depth values are outside the valid range\n"
                         "2. Segmentation mask doesn't overlap with valid depth pixels\n"
                         "3. Depth data is invalid or all zeros"
                     )
                 )
 
-            # Step 2: Generate grasps
-            print("Generating grasps...")
-            grasp_qt, scores = dex_diffuser.sample_grasps(obj_pcd, num_samples=num_samples)
+            # Process point cloud (unit conversion, centering, save debug files)
+            output_dir = Path(DEBUG_OUTPUT_DIR)
+            obj_pcd_centered, obj_pcd_in_camera, obj_center, scale_factor = process_point_cloud(
+                obj_pcd, output_dir, pcd
+            )
 
-            # Step 3: Transform grasps to robot base frame
-            print("Transforming grasps to robot base frame...")
+            # Generate and transform grasps
             camera_extrinsics_matrix = np.load(extrinsics_path)
-            grasp_qt_base = transform_grasps_to_base_frame(
-                grasp_qt=grasp_qt,
-                obj_center_in_camera=obj_pcd_center_in_camera,
-                scale_factor=scale_factor,
-                camera_extrinsics=camera_extrinsics_matrix
+            grasps_base, scores, best_idx = generate_and_transform_grasps(
+                obj_pcd_centered,
+                obj_center,
+                scale_factor,
+                camera_extrinsics_matrix,
+                num_samples,
+                dex_diffuser
             )
 
-            # Find best grasp
-            best_grasp_index = int(np.argmax(scores))
-
-            print(f"\n=== Best Grasp Selected ===")
-            print(f"Best grasp index: {best_grasp_index}")
-            print(f"Best score: {scores[best_grasp_index]:.4f}")
-            print(f"Best grasp (23 dims): [qw, qx, qy, qz, x, y, z, joints...]")
-            print(f"  Quaternion (w,x,y,z): {grasp_qt_base[best_grasp_index, 0:4]}")
-            print(f"  Position (x,y,z): {grasp_qt_base[best_grasp_index, 4:7]}")
-            print(f"===========================\n")
-
-            # Save additional debug files for visualization
-            np.save(output_dir / "camera_extrinsics.npy", camera_extrinsics_matrix)
-            np.save(output_dir / "best_grasp_base.npy", grasp_qt_base[best_grasp_index])
-            print(f"Saved camera_extrinsics.npy and best_grasp_base.npy to {output_dir}/")
-
-            # Prepare response (using transformed grasps in robot base frame)
-            response = GraspResponse(
-                grasp_qt=grasp_qt_base.tolist(),
-                scores=scores.tolist(),
-                best_grasp_index=best_grasp_index,
-                best_grasp=grasp_qt_base[best_grasp_index].tolist(),
-                best_score=float(scores[best_grasp_index]),
-                metadata={
-                    "ply_file_base64": base64.b64encode(ply_content).decode('utf-8')
-                }
+            # Save debug files
+            overlay_path = results["paths"].get("overlay")
+            save_debug_files(
+                output_dir,
+                camera_extrinsics_matrix,
+                grasps_base[best_idx],
+                rgb_path=rgb_path,
+                depth_np=depth_np,
+                mask_path=Path(results["paths"]["mask"]),
+                overlay_path=Path(overlay_path) if overlay_path else None
             )
 
+            # Create response
+            ply_path = output_dir / "object_colored.ply"
+            response = create_grasp_response(grasps_base, scores, best_idx, ply_path)
+
+            # Launch visualization
             print("Grasp generation completed successfully!")
+            launch_visualization(obj_pcd_in_camera, grasps_base, scores, camera_extrinsics_matrix)
 
-            # Launch visualization in background thread (non-blocking)
-            def run_visualization():
-                try:
-                    print("\n" + "="*60)
-                    print("Starting visualization in background...")
-                    print("="*60)
-                    visualize_from_camera_view(
-                        obj_pcd_in_camera=obj_pcd_in_camera_frame,
-                        grasp_in_base=grasp_qt_base[best_grasp_index],
-                        camera_extrinsics=camera_extrinsics_matrix,
-                        robot='allegro_right'
-                    )
-                except Exception as e:
-                    print(f"Visualization error: {e}")
+            return response
 
-            # Start visualization in background thread
-            viz_thread = threading.Thread(target=run_visualization, daemon=True)
-            viz_thread.start()
-            print("Visualization launched in background thread")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+
+@app.post("/process_pcd", response_model=GraspResponse)
+async def process_pcd(
+    point_cloud: UploadFile = File(...),
+    camera_extrinsics: UploadFile = File(...),
+    num_samples: int = Form(32)
+):
+    """
+    Process point cloud directly and generate grasps.
+
+    Args:
+        point_cloud: Point cloud file (.pt format) with shape [N, 3+] (x, y, z, ...)
+        camera_extrinsics: 4x4 camera extrinsic matrix (.npy file) - transformation from camera to robot base
+        num_samples: Number of grasp samples to generate
+
+    Returns:
+        GraspResponse with grasp poses in robot base frame and scores
+        Grasp format (23 dims): [qw, qx, qy, qz, x, y, z, joint_angles(16)]
+    """
+    if dex_diffuser is None:
+        raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            temp_path = Path(temp_dir)
+
+            # Save uploaded files
+            pcd_path = temp_path / "point_cloud.pt"
+            extrinsics_path = temp_path / "camera_extrinsics.npy"
+
+            for file, path in [(point_cloud, pcd_path), (camera_extrinsics, extrinsics_path)]:
+                content = await file.read()
+                with open(path, "wb") as f:
+                    f.write(content)
+
+            # Load and prepare point cloud
+            print("Loading point cloud...")
+            pcd_data = torch.load(pcd_path)
+            if isinstance(pcd_data, torch.Tensor):
+                pcd_data = pcd_data.cpu().numpy()
+
+            obj_pcd = pcd_data[:, :3]  # Extract xyz coordinates
+            print(f"Point cloud loaded with shape: {obj_pcd.shape}")
+
+            if obj_pcd.shape[0] == 0:
+                raise HTTPException(status_code=400, detail="Point cloud is empty")
+
+            # Preprocess point cloud (downsample, remove noise and plane)
+            pcd_o3d = o3d.geometry.PointCloud()
+            pcd_o3d.points = o3d.utility.Vector3dVector(obj_pcd)
+            pcd_o3d = pcd_o3d.voxel_down_sample(voxel_size=VOXEL_SIZE)
+            pcd_o3d, _ = pcd_o3d.remove_statistical_outlier(
+                nb_neighbors=OUTLIER_NB_NEIGHBORS_PCD,
+                std_ratio=OUTLIER_STD_RATIO_PCD
+            )
+
+            # Remove plane (table surface)
+            _, inliers = pcd_o3d.segment_plane(
+                distance_threshold=PLANE_DISTANCE_THRESHOLD,
+                ransac_n=PLANE_RANSAC_N,
+                num_iterations=PLANE_NUM_ITERATIONS
+            )
+            pcd_o3d = pcd_o3d.select_by_index(inliers, invert=True)
+            obj_pcd = np.asarray(pcd_o3d.points)
+
+            # Process point cloud (unit conversion, centering, save debug files)
+            output_dir = Path(DEBUG_OUTPUT_DIR)
+            obj_pcd_centered, obj_pcd_in_camera, obj_center, scale_factor = process_point_cloud(
+                obj_pcd, output_dir, pcd_o3d
+            )
+
+            # Generate and transform grasps
+            camera_extrinsics_matrix = np.load(extrinsics_path)
+            grasps_base, scores, best_idx = generate_and_transform_grasps(
+                obj_pcd_centered,
+                obj_center,
+                scale_factor,
+                camera_extrinsics_matrix,
+                num_samples,
+                dex_diffuser
+            )
+
+            # Save debug files
+            save_debug_files(output_dir, camera_extrinsics_matrix, grasps_base[best_idx])
+
+            # Create response
+            ply_path = output_dir / "object_colored.ply"
+            response = create_grasp_response(grasps_base, scores, best_idx, ply_path)
+
+            # Launch visualization
+            print("Grasp generation completed successfully!")
+            launch_visualization(obj_pcd_in_camera, grasps_base, scores, camera_extrinsics_matrix)
 
             return response
 
