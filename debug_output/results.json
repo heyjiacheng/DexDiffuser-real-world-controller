@@ -1,0 +1,17 @@
+{
+  "label": "tensor(0)",
+  "box": [
+    923.4698486328125,
+    801.8414306640625,
+    1259.639892578125,
+    1146.1064453125
+  ],
+  "score": 0.27485671639442444,
+  "iou": 1.003342628479004,
+  "mask_area": 86254,
+  "paths": {
+    "detection_viz": "debug_output/detection/detected_objects.png",
+    "mask": "debug_output/segmentation/mask_tensor(0).png",
+    "overlay": "debug_output/segmentation/segmentation_overlay_tensor(0).png"
+  }
+}

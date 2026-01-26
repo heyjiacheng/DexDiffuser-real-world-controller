@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 from contextlib import asynccontextmanager
+import base64
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -26,12 +27,6 @@ import threading
 
 # Global DexDiffuser instance (loaded once at startup)
 dex_diffuser = None
-
-# Global storage for generated grasps (shared between process_grasp/process_pcd and select_grasp)
-latest_grasps_data = {
-    "grasps_base": None,      # (N, 23) array of grasps in robot base frame
-    "scores": None,           # (N,) array of scores
-}
 
 
 @asynccontextmanager
@@ -206,12 +201,14 @@ def generate_and_transform_grasps(
     grasp_qt, scores = dex_diffuser_model.sample_grasps(obj_pcd_centered, num_samples=num_samples)
 
     print("Transforming grasps to robot base frame...")
-    grasp_qt_base = transform_grasps_to_base_frame(
-        grasp_qt=grasp_qt,
-        obj_center_in_camera=obj_center_in_camera,
-        scale_factor=scale_factor,
-        camera_extrinsics=camera_extrinsics
-    )
+    # grasp_qt_base = transform_grasps_to_base_frame(
+    #     grasp_qt=grasp_qt,
+    #     obj_center_in_camera=obj_center_in_camera,
+    #     scale_factor=scale_factor,
+    #     camera_extrinsics=camera_extrinsics
+    # )
+    grasp_qt_base = grasp_qt
+    grasp_qt_base[:, 4:7] += obj_center_in_camera[np.newaxis, :]
 
     best_grasp_index = int(np.argmax(scores))
 
@@ -254,6 +251,28 @@ def launch_visualization(
     viz_thread = threading.Thread(target=run_visualization, daemon=True)
     viz_thread.start()
     print(f"Interactive visualization launched at http://127.0.0.1:{port}")
+
+
+def create_grasp_response(
+    grasps_base: np.ndarray,
+    scores: np.ndarray,
+    best_grasp_index: int,
+    ply_path: Path
+) -> GraspResponse:
+    """Create API response with grasp data."""
+    with open(ply_path, "rb") as f:
+        ply_content = f.read()
+
+    return GraspResponse(
+        grasp_qt=grasps_base.tolist(),
+        scores=scores.tolist(),
+        best_grasp_index=best_grasp_index,
+        best_grasp=grasps_base[best_grasp_index].tolist(),
+        best_score=float(scores[best_grasp_index]),
+        metadata={
+            "ply_file_base64": base64.b64encode(ply_content).decode('utf-8')
+        }
+    )
 
 
 def transform_grasps_to_base_frame(
@@ -345,13 +364,18 @@ def transform_grasps_to_base_frame(
 # Request/Response Models
 # ============================================================================
 
-class GraspSelectionRequest(BaseModel):
-    """Request for selecting a grasp by index."""
-    grasp_index: int
+class GraspRequest(BaseModel):
+    target_objects: List[str]
+    confidence_threshold: float = 0.1
+    num_samples: int = 32
 
-class GraspSelectionResponse(BaseModel):
-    """Response for grasp selection endpoint."""
-    grasp_pose: List[float]  # [qw, qx, qy, qz, x, y, z, joint_angles(16)]
+class GraspResponse(BaseModel):
+    grasp_qt: List[List[float]]
+    scores: List[float]
+    best_grasp_index: int
+    best_grasp: List[float]
+    best_score: float
+    metadata: Dict[str, Any]
 
 
 # ============================================================================
@@ -363,14 +387,10 @@ async def root():
     return {
         "message": "DexDiffuser Grasp Generation API",
         "endpoints": {
-            "/process_grasp": "POST - Generate grasps from RGB-D and launch visualization",
-            "/process_pcd": "POST - Generate grasps from point cloud and launch visualization",
-            "/select_grasp": "POST - Retrieve grasp pose by index after visualization selection",
+            "/process_grasp": "POST - Main endpoint for grasp generation from RGB-D",
+            "/process_pcd": "POST - Generate grasps directly from point cloud (.pt file)",
             "/health": "GET - Health check"
-        },
-        "usage": "1) Call /process_grasp or /process_pcd to generate grasps and open visualization. "
-                 "2) Select a grasp in the visualization. "
-                 "3) Call /select_grasp with the selected index to get the grasp pose."
+        }
     }
 
 @app.get("/health")
@@ -380,7 +400,7 @@ async def health_check():
         "model_loaded": dex_diffuser is not None
     }
 
-@app.post("/process_grasp")
+@app.post("/process_grasp", response_model=GraspResponse)
 async def process_grasp(
     rgb_image: UploadFile = File(...),
     depth_data: UploadFile = File(...),
@@ -391,10 +411,7 @@ async def process_grasp(
     num_samples: int = Form(32)
 ):
     """
-    Generate grasps from RGB-D data and launch interactive visualization.
-
-    This endpoint generates grasp candidates and launches a visualization interface.
-    Use the /select_grasp endpoint to retrieve a specific grasp pose after selection.
+    Main endpoint to process RGB-D data and generate grasps.
 
     Args:
         rgb_image: RGB image file (PNG/JPG)
@@ -404,8 +421,11 @@ async def process_grasp(
         target_objects: Comma-separated list of target objects
         confidence_threshold: Detection confidence threshold
         num_samples: Number of grasp samples to generate
+
+    Returns:
+        GraspResponse with grasp poses in robot base frame and scores
+        Grasp format (23 dims): [qw, qx, qy, qz, x, y, z, joint_angles(16)]
     """
-    global latest_grasps_data
     if dex_diffuser is None:
         raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
 
@@ -510,37 +530,39 @@ async def process_grasp(
                 overlay_path=Path(overlay_path) if overlay_path else None
             )
 
-            # Store grasps data globally for later selection
-            latest_grasps_data["grasps_base"] = grasps_base
-            latest_grasps_data["scores"] = scores
+            # Create response
+            ply_path = output_dir / "object_colored.ply"
+            response = create_grasp_response(grasps_base, scores, best_idx, ply_path)
 
             # Launch visualization
             print("Grasp generation completed successfully!")
             launch_visualization(obj_pcd_in_camera, grasps_base, scores, camera_extrinsics_matrix)
+
+            return response
 
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
-@app.post("/process_pcd")
+@app.post("/process_pcd", response_model=GraspResponse)
 async def process_pcd(
     point_cloud: UploadFile = File(...),
     camera_extrinsics: UploadFile = File(...),
     num_samples: int = Form(32)
 ):
     """
-    Generate grasps from point cloud and launch interactive visualization.
-
-    This endpoint generates grasp candidates and launches a visualization interface.
-    Use the /select_grasp endpoint to retrieve a specific grasp pose after selection.
+    Process point cloud directly and generate grasps.
 
     Args:
         point_cloud: Point cloud file (.pt format) with shape [N, 3+] (x, y, z, ...)
         camera_extrinsics: 4x4 camera extrinsic matrix (.npy file) - transformation from camera to robot base
         num_samples: Number of grasp samples to generate
+
+    Returns:
+        GraspResponse with grasp poses in robot base frame and scores
+        Grasp format (23 dims): [qw, qx, qy, qz, x, y, z, joint_angles(16)]
     """
-    global latest_grasps_data
     if dex_diffuser is None:
         raise HTTPException(status_code=503, detail="DexDiffuser model not loaded")
 
@@ -607,55 +629,20 @@ async def process_pcd(
             # Save debug files
             save_debug_files(output_dir, camera_extrinsics_matrix, grasps_base[best_idx])
 
-            # Store grasps data globally for later selection
-            latest_grasps_data["grasps_base"] = grasps_base
-            latest_grasps_data["scores"] = scores
+            # Create response
+            ply_path = output_dir / "object_colored.ply"
+            response = create_grasp_response(grasps_base, scores, best_idx, ply_path)
 
             # Launch visualization
             print("Grasp generation completed successfully!")
             launch_visualization(obj_pcd_in_camera, grasps_base, scores, camera_extrinsics_matrix)
 
+            return response
+
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
-
-
-@app.post("/select_grasp", response_model=GraspSelectionResponse)
-async def select_grasp(request: GraspSelectionRequest):
-    """
-    Retrieve a specific grasp pose by index.
-
-    Args:
-        request: GraspSelectionRequest containing grasp_index
-
-    Returns:
-        GraspSelectionResponse with grasp_pose (23 dims): [qw, qx, qy, qz, x, y, z, joint_angles(16)]
-    """
-    if latest_grasps_data["grasps_base"] is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No grasps available. Please call /process_grasp or /process_pcd first."
-        )
-
-    grasps_base = latest_grasps_data["grasps_base"]
-    scores = latest_grasps_data["scores"]
-    grasp_index = request.grasp_index
-
-    if grasp_index < 0 or grasp_index >= len(scores):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid grasp_index {grasp_index}. Valid range: 0 to {len(scores) - 1}"
-        )
-
-    selected_grasp = grasps_base[grasp_index]
-
-    # Update debug file with selected grasp
-    np.save(Path(DEBUG_OUTPUT_DIR) / "best_grasp_base.npy", selected_grasp)
-    print(f"Selected grasp index: {grasp_index}, score: {scores[grasp_index]:.4f}")
-
-    return GraspSelectionResponse(grasp_pose=selected_grasp.tolist())
-
 
 if __name__ == "__main__":
     # Run server
