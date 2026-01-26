@@ -3,15 +3,23 @@
 Clean inference script for DexDiffuser grasp generation.
 
 Usage:
+    # From mesh:
     python infer_custom.py --mesh_path "/path/to/mesh.obj"
     python infer_custom.py --mesh_path "/path/to/mesh.obj" --num_samples 32 --show_viz
     python infer_custom.py --mesh_path "/path/to/mesh.obj" --output_dir ./results
+
+    # From image (RGB-D + language instruction):
+    python infer_custom.py --image_path "/path/to/rgb.png" --depth_path "/path/to/depth.npy" \
+                           --camera_intrinsics "/path/to/K.npy" --target_object "bear"
+    python infer_custom.py --image_path "/path/to/rgb.png" --depth_path "/path/to/depth.npy" \
+                           --camera_intrinsics "/path/to/K.npy" --target_object "cup" --num_samples 32
 """
 
 import os
 import argparse
 import numpy as np
 import torch
+import cv2
 import open3d as o3d
 from pathlib import Path
 from loguru import logger
@@ -24,6 +32,7 @@ from bps_torch.bps import bps_torch
 from utils.rot6d import robust_compute_rotation_matrix_from_ortho6d
 from utils.handmodel import get_handmodel, angle_denormalize
 from scipy.spatial.transform import Rotation as R
+from gen_pcds.main import detect_seg_pipeline, pcd_from_rgbd_cpu
 
 
 def load_config(config_path: str):
@@ -58,8 +67,126 @@ def mesh_to_pointcloud(mesh_path: str, num_points: int = 2048, scale: float = 1.
     pcd = mesh.sample_points_uniformly(number_of_points=num_points)
     points = np.asarray(pcd.points).astype(np.float32)
 
-    logger.info(f"Sampled {len(points)} points from mesh")
-    return points
+    # Center the point cloud (DexDiffuser expects centered point clouds)
+    pcd_center = points.mean(axis=0)
+    points_centered = points - pcd_center
+    logger.info(f"Centered point cloud. Original center: {pcd_center}")
+
+    logger.info(f"Sampled {len(points_centered)} points from mesh")
+    return points_centered
+
+
+# Constants for image-based point cloud processing
+OUTLIER_NB_NEIGHBORS = 100
+OUTLIER_STD_RATIO = 2.0
+
+
+def image_to_pointcloud(
+    image_path: str,
+    depth_path: str,
+    camera_intrinsics_path: str,
+    target_object: str,
+    confidence_threshold: float = 0.1,
+    output_dir: str = None,
+    scale: float = 1.0
+) -> np.ndarray:
+    """
+    Convert RGB-D image with semantic segmentation to a point cloud.
+
+    Args:
+        image_path: Path to the RGB image file (.png, .jpg)
+        depth_path: Path to the depth data file (.npy)
+        camera_intrinsics_path: Path to the camera intrinsics matrix (.npy, 3x3)
+        target_object: Language instruction for semantic segmentation (e.g., "bear", "cup")
+        confidence_threshold: Detection confidence threshold
+        output_dir: Directory to save intermediate results (mask, overlay, etc.)
+        scale: Scale factor to apply to the point cloud (e.g., 0.001 to convert mm to meters)
+
+    Returns:
+        Point cloud as numpy array of shape (N, 3)
+    """
+    logger.info(f"Loading image from: {image_path}")
+    logger.info(f"Loading depth from: {depth_path}")
+    logger.info(f"Target object: {target_object}")
+
+    # Determine output directory for segmentation results
+    if output_dir is None:
+        output_dir = str(Path(image_path).parent)
+
+    # Run detection and segmentation
+    logger.info("Running detection and segmentation...")
+    target_objects_list = [target_object.strip()]
+    results = detect_seg_pipeline(
+        image_path=str(image_path),
+        out_root=output_dir,
+        target_objects=target_objects_list,
+        confidence_threshold=confidence_threshold
+    )
+
+    if results is None:
+        raise ValueError(
+            f"No objects detected for target '{target_object}'. "
+            "Try lowering confidence_threshold or checking the target_object name."
+        )
+
+    logger.info(f"Detection/segmentation completed. Result keys: {list(results.keys())}")
+
+    # Load mask, color image, depth, and camera intrinsics
+    mask_path = results["paths"]["mask"]
+    mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED).astype(bool)
+    logger.info(f"Loaded mask from: {mask_path}, shape: {mask.shape}")
+
+    color_o3d = o3d.io.read_image(str(image_path))
+    depth_np = np.load(depth_path)
+    K = np.load(camera_intrinsics_path)
+
+    logger.info(f"Depth shape: {depth_np.shape}, dtype: {depth_np.dtype}")
+    logger.info(f"Camera intrinsics:\n{K}")
+
+    # Generate point cloud from RGB-D and mask
+    logger.info("Generating point cloud from RGB-D...")
+    geoms = pcd_from_rgbd_cpu(
+        color_img_o3d=color_o3d,
+        depth_np=depth_np,
+        K=K,
+        depth_unit="mm",
+        flip_for_view=False,
+        add_axis=True,
+        axis_size=0.1,
+        mask=mask
+    )
+
+    # Apply statistical outlier removal
+    pcd, _ = geoms[0].remove_statistical_outlier(
+        nb_neighbors=OUTLIER_NB_NEIGHBORS,
+        std_ratio=OUTLIER_STD_RATIO
+    )
+
+    points = np.asarray(pcd.points).astype(np.float32)
+
+    if points.shape[0] == 0:
+        raise ValueError(
+            "Generated point cloud is empty. This could be due to:\n"
+            "1. Depth values are outside the valid range\n"
+            "2. Segmentation mask doesn't overlap with valid depth pixels\n"
+            "3. Depth data is invalid or all zeros"
+        )
+
+    points = points * 1000.0 * scale
+
+    # Center the point cloud (DexDiffuser expects centered point clouds)
+    pcd_center = points.mean(axis=0)
+    points_centered = points - pcd_center
+    logger.info(f"Centered point cloud. Original center: {pcd_center}")
+
+    logger.info(f"Generated {len(points_centered)} points from image")
+    logger.info(f"Point cloud range: min={points_centered.min(axis=0)}, max={points_centered.max(axis=0)}")
+
+    # Save intermediate results if overlay exists
+    if "overlay" in results["paths"] and results["paths"]["overlay"]:
+        logger.info(f"Segmentation overlay saved to: {results['paths']['overlay']}")
+
+    return points_centered
 
 
 def convert_transformation_matrix_to_qt(transformation_matrix: np.ndarray) -> np.ndarray:
@@ -249,13 +376,43 @@ class DexDiffuserInference:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DexDiffuser Grasp Generation Inference")
-    parser.add_argument("--mesh_path", type=str, required=True,
-                        help="Path to the input mesh file (.obj, .ply, .stl)")
+    parser = argparse.ArgumentParser(
+        description="DexDiffuser Grasp Generation Inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # From mesh:
+  python infer_custom.py --mesh_path "/path/to/mesh.obj"
+  python infer_custom.py --mesh_path "/path/to/mesh.obj" --num_samples 32 --show_viz
+
+  # From image (RGB-D + language instruction):
+  python infer_custom.py --image_path "/path/to/rgb.png" --depth_path "/path/to/depth.npy" \\
+                         --camera_intrinsics "/path/to/K.npy" --target_object "bear"
+        """
+    )
+
+    # Input source group (mutually exclusive: mesh OR image)
+    input_group = parser.add_argument_group("Input source (choose one)")
+    input_group.add_argument("--mesh_path", type=str, default=None,
+                             help="Path to the input mesh file (.obj, .ply, .stl)")
+
+    # Image-based input arguments
+    input_group.add_argument("--image_path", type=str, default=None,
+                             help="Path to the RGB image file (.png, .jpg)")
+    input_group.add_argument("--depth_path", type=str, default=None,
+                             help="Path to the depth data file (.npy)")
+    input_group.add_argument("--camera_intrinsics", type=str, default=None,
+                             help="Path to the camera intrinsics matrix (.npy, 3x3)")
+    input_group.add_argument("--target_object", type=str, default=None,
+                             help="Language instruction for semantic segmentation (e.g., 'bear', 'cup')")
+    input_group.add_argument("--confidence_threshold", type=float, default=0.1,
+                             help="Detection confidence threshold for segmentation")
+
+    # Common arguments
     parser.add_argument("--num_samples", type=int, default=32,
                         help="Number of grasp samples to generate")
     parser.add_argument("--num_points", type=int, default=2048,
-                        help="Number of points to sample from the mesh")
+                        help="Number of points to sample from the mesh (mesh input only)")
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Directory to save results")
     parser.add_argument("--config_dir", type=str, default="configs",
@@ -267,19 +424,54 @@ def main():
     parser.add_argument("--save_viz", action="store_true", default=True,
                         help="Save visualization as HTML file")
     parser.add_argument("--scale", type=float, default=1.0,
-                        help="Scale factor to apply to the mesh")
+                        help="Scale factor to apply to the point cloud (e.g., 0.001 to convert mm to meters)")
 
     args = parser.parse_args()
+
+    # Validate input arguments
+    use_mesh = args.mesh_path is not None
+    use_image = args.image_path is not None
+
+    if not use_mesh and not use_image:
+        parser.error("Must provide either --mesh_path OR (--image_path, --depth_path, --camera_intrinsics, --target_object)")
+
+    if use_mesh and use_image:
+        parser.error("Cannot use both --mesh_path and --image_path. Choose one input source.")
+
+    if use_image:
+        missing = []
+        if args.depth_path is None:
+            missing.append("--depth_path")
+        if args.camera_intrinsics is None:
+            missing.append("--camera_intrinsics")
+        if args.target_object is None:
+            missing.append("--target_object")
+        if missing:
+            parser.error(f"When using --image_path, the following arguments are also required: {', '.join(missing)}")
 
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get mesh name for output files
-    mesh_name = Path(args.mesh_path).stem
-
-    # Convert mesh to point cloud (with optional scaling)
-    obj_pcd = mesh_to_pointcloud(args.mesh_path, num_points=args.num_points, scale=args.scale)
+    # Generate point cloud based on input type
+    if args.mesh_path is not None:
+        # Mesh-based input
+        input_name = Path(args.mesh_path).stem
+        logger.info(f"Using mesh input: {args.mesh_path}")
+        obj_pcd = mesh_to_pointcloud(args.mesh_path, num_points=args.num_points, scale=args.scale)
+    else:
+        # Image-based input (RGB-D + semantic segmentation)
+        input_name = Path(args.image_path).stem
+        logger.info(f"Using image input: {args.image_path}")
+        obj_pcd = image_to_pointcloud(
+            image_path=args.image_path,
+            depth_path=args.depth_path,
+            camera_intrinsics_path=args.camera_intrinsics,
+            target_object=args.target_object,
+            confidence_threshold=args.confidence_threshold,
+            output_dir=str(output_dir),
+            scale=args.scale
+        )
 
     # Initialize model and run inference
     model = DexDiffuserInference(config_dir=args.config_dir, device=args.device)
@@ -324,7 +516,7 @@ def main():
 
     # Save visualization for all samples
     if args.save_viz or args.show_viz:
-        viz_dir = output_dir / f"{mesh_name}_visualizations"
+        viz_dir = output_dir / f"{input_name}_visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
         for rank, idx in enumerate(sorted_viz_indices):

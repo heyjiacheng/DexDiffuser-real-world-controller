@@ -12,6 +12,10 @@ python infer_custom.py --mesh_path "/home/supertc/repo/hamer/dexgraspnet_viz/ham
 
 (optional) add --show_viz will pop up a window to viz
 
+```bash
+python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_test/0_depth_aligned_rgb.npy" --camera_intrinsics "sim_test/0_camerainfo.npy" --target_object "bottle" --num_samples 32
+```
+
 Dexdiffuser as server:
 
 ```bash
