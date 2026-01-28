@@ -60,7 +60,7 @@ class HandModel:
         if robot_name == 'shadowhand':
             self.palm_toward = torch.tensor([0., -1., 0., 0.], device=self.device).reshape(1, 1, 4).repeat(self.batch_size, 1, 1)
         elif robot_name == 'allegro' or 'allegro_right':
-            self.palm_toward = torch.tensor([0., -1., 0., 0.], device=self.device).reshape(1, 1, 4).repeat(self.batch_size, 1, 1)
+            self.palm_toward = torch.tensor([1., 0., 0., 0.], device=self.device).reshape(1, 1, 4).repeat(self.batch_size, 1, 1)
             
         else:
             raise NotImplementedError

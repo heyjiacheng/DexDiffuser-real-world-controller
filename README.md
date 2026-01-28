@@ -20,7 +20,14 @@ python infer_custom.py --mesh_path "/home/supertc/repo/hamer/dexgraspnet_viz/ham
 Direct visualize dexdiffuser on own dataset (image input):
 
 ```bash
-python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_test/0_depth_aligned_rgb.npy" --camera_intrinsics "sim_test/0_camerainfo.npy" --target_object "bottle" --num_samples 32
+python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_test/0_depth_aligned_rgb.npy" --camera_intrinsics "sim_test/0_camerainfo.npy" --target_object "bottle"
+```
+
+image input + grasp point close to part-level object
+(grasp point = palm center + palm direction 7cm)
+
+```bash
+python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_test/0_depth_aligned_rgb.npy" --camera_intrinsics "sim_test/0_camerainfo.npy" --target_object "bottle" --part "cap" --num_samples 1000
 ```
 
 Dexdiffuser as server:

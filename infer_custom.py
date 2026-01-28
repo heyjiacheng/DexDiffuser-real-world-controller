@@ -436,8 +436,29 @@ class DexDiffuserInference:
 
         hand_model.update_kinematics(q=grasp_output.to('cuda'))
 
+        # Calculate grasp center (palm center + palm toward * 5cm)
+        palm_center, palm_toward = hand_model.get_palm_center_and_toward()
+        grasp_center = palm_center.cpu().numpy()[0] + palm_toward.cpu().numpy()[0] * 0.07
+
         vis_data = [plot_point_cloud(obj_pcd, color='pink')]
         vis_data += hand_model.get_plotly_data(opacity=0.5, color='lightblue')
+
+        # Add grasp center point as a prominent marker (comment here to avoid marker)
+        vis_data.append(
+            go.Scatter3d(
+                x=[grasp_center[0]],
+                y=[grasp_center[1]],
+                z=[grasp_center[2]],
+                mode='markers',
+                marker=dict(
+                    color='red',
+                    size=10,
+                    symbol='diamond',
+                    line=dict(color='darkred', width=2)
+                ),
+                name='Grasp Center'
+            )
+        )
 
         fig = go.Figure(data=vis_data)
         fig.update_layout(
@@ -583,12 +604,60 @@ Examples:
     for i in range(len(scores_sorted)):
         logger.info(f"  Grasp {i+1}: score = {scores_sorted[i]:.4f}")
 
+    # If part point cloud exists, re-sort by distance from grasp center to part center
+    if args.part is not None and part_pcd is not None:
+        logger.info(f"\nRe-sorting grasps by distance to part '{args.part}' center...")
+
+        # Calculate part point cloud center
+        part_center = part_pcd.mean(axis=0)
+        logger.info(f"Part center: {part_center}")
+
+        # Create hand model to compute grasp centers
+        hand_model = get_handmodel(
+            batch_size=1, device=args.device,
+            urdf_path='data/urdf', robot='allegro_right'
+        )
+
+        # Compute grasp center (palm center + palm toward * 5cm) for each grasp
+        grasp_centers = []
+        for i in range(len(outputs_viz_sorted)):
+            # Update hand kinematics with current grasp
+            hand_model.update_kinematics(outputs_viz_sorted[i:i+1].to(args.device))
+
+            # Get palm center and toward direction
+            palm_center, palm_toward = hand_model.get_palm_center_and_toward()
+
+            # Grasp center is 5cm along the palm toward direction
+            grasp_center = palm_center.cpu().numpy()[0] + palm_toward.cpu().numpy()[0] * 0.07
+            grasp_centers.append(grasp_center)
+
+        grasp_centers = np.array(grasp_centers)
+
+        # Compute distances from grasp centers to part center
+        distances = np.linalg.norm(grasp_centers - part_center, axis=1)
+
+        # Re-sort by distance (nearest to farthest)
+        distance_sorted_indices = np.argsort(distances)
+        grasp_qt_sorted = grasp_qt_sorted[distance_sorted_indices]
+        scores_sorted = scores_sorted[distance_sorted_indices]
+        outputs_viz_sorted = outputs_viz_sorted[distance_sorted_indices]
+        distances_sorted = distances[distance_sorted_indices]
+
+        # Print re-sorted grasps with distances
+        logger.info(f"\nGrasps re-sorted by distance to part center:")
+        for i in range(len(distances_sorted)):
+            logger.info(f"  Grasp {i+1}: score = {scores_sorted[i]:.4f}, distance to part = {distances_sorted[i]:.4f}")
+
     # Save visualization for all samples using the same outputs from inference
     if args.save_viz or args.show_viz:
         viz_dir = output_dir / f"{input_name}_visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
-        for rank in range(len(scores_sorted)):
+        # Determine how many grasps to save: min(num_samples, 32)
+        num_to_save = min(len(scores_sorted), 32)
+        logger.info(f"Saving top {num_to_save} grasps (out of {len(scores_sorted)} total)")
+
+        for rank in range(num_to_save):
             score = scores_sorted[rank]
             viz_path = viz_dir / f"grasp_{rank+1:03d}_score_{score:.4f}.html" if args.save_viz else None
             # Only show interactive window for the best grasp
@@ -599,7 +668,7 @@ Examples:
                 save_path=str(viz_path) if viz_path else None,
                 show=show_this
             )
-        logger.info(f"Saved {len(scores_sorted)} visualizations to: {viz_dir}")
+        logger.info(f"Saved {num_to_save} visualizations to: {viz_dir}")
 
     logger.info("Inference complete!")
     return grasp_qt_sorted, scores_sorted
