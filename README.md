@@ -4,13 +4,20 @@ FastAPI service for real-time dexterous grasp generation.
 
 ## Quick Start
 
-Direct visualize dexdiffuser on own dataset:
+load env:
+```bash
+conda activate dexdiff
+```
+
+Direct visualize dexdiffuser on own dataset (point cloud input):
 
 ```bash
 python infer_custom.py --mesh_path "/home/supertc/repo/hamer/dexgraspnet_viz/hammer_1_pound/mesh/coacd/decomposed.obj" --scale 0.2
 ```
 
 (optional) add --show_viz will pop up a window to viz
+
+Direct visualize dexdiffuser on own dataset (image input):
 
 ```bash
 python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_test/0_depth_aligned_rgb.npy" --camera_intrinsics "sim_test/0_camerainfo.npy" --target_object "bottle" --num_samples 32
@@ -19,7 +26,6 @@ python infer_custom.py --image_path "sim_test/0_color.png" --depth_path "sim_tes
 Dexdiffuser as server:
 
 ```bash
-conda activate dexdiff
 python api_service.py
 ```
 Server runs on `http://0.0.0.0:8000`

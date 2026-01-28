@@ -88,8 +88,9 @@ def image_to_pointcloud(
     target_object: str,
     confidence_threshold: float = 0.1,
     output_dir: str = None,
-    scale: float = 1.0
-) -> np.ndarray:
+    scale: float = 1.0,
+    part: str = None
+) -> tuple:
     """
     Convert RGB-D image with semantic segmentation to a point cloud.
 
@@ -101,9 +102,11 @@ def image_to_pointcloud(
         confidence_threshold: Detection confidence threshold
         output_dir: Directory to save intermediate results (mask, overlay, etc.)
         scale: Scale factor to apply to the point cloud (e.g., 0.001 to convert mm to meters)
+        part: Optional part of the object to segment separately (e.g., "bottle cap")
 
     Returns:
-        Point cloud as numpy array of shape (N, 3)
+        tuple: (object_pcd, part_pcd) where object_pcd is the main object point cloud (N, 3)
+               and part_pcd is the part point cloud (M, 3) or None if part is not specified
     """
     logger.info(f"Loading image from: {image_path}")
     logger.info(f"Loading depth from: {depth_path}")
@@ -186,7 +189,86 @@ def image_to_pointcloud(
     if "overlay" in results["paths"] and results["paths"]["overlay"]:
         logger.info(f"Segmentation overlay saved to: {results['paths']['overlay']}")
 
-    return points_centered
+    # Store the main object point cloud
+    object_points_centered = points_centered
+
+    # If part is specified, perform second segmentation
+    part_points_centered = None
+    if part is not None:
+        logger.info(f"Starting second segmentation for part: '{part}'")
+
+        # Create debug directory
+        debug_dir = os.path.join(output_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        logger.info(f"Debug output directory: {debug_dir}")
+
+        # Create masked image: only keep the target object region, mask out the rest
+        image_np = cv2.imread(str(image_path))
+        masked_image_np = image_np.copy()
+        # Set non-mask regions to white (better for detection)
+        masked_image_np[~mask] = 255
+
+        # Save the masked image for second segmentation
+        masked_image_path = os.path.join(debug_dir, "masked_target_object.png")
+        cv2.imwrite(masked_image_path, masked_image_np)
+        logger.info(f"Saved masked image (only target object region) to: {masked_image_path}")
+
+        # Run detection and segmentation for the part on the masked image
+        part_results = detect_seg_pipeline(
+            image_path=masked_image_path,
+            out_root=debug_dir,
+            target_objects=[part.strip()],
+            confidence_threshold=confidence_threshold
+        )
+
+        if part_results is not None:
+            logger.info(f"Part '{part}' detected successfully")
+
+            # Load part mask
+            part_mask_path = part_results["paths"]["mask"]
+            part_mask = cv2.imread(part_mask_path, cv2.IMREAD_UNCHANGED).astype(bool)
+            logger.info(f"Loaded part mask from: {part_mask_path}, shape: {part_mask.shape}")
+
+            # Generate point cloud from RGB-D and part mask
+            logger.info("Generating point cloud for part...")
+            part_geoms = pcd_from_rgbd_cpu(
+                color_img_o3d=color_o3d,
+                depth_np=depth_np,
+                K=K,
+                depth_unit="mm",
+                flip_for_view=False,
+                add_axis=True,
+                axis_size=0.1,
+                mask=part_mask
+            )
+
+            # Apply statistical outlier removal
+            part_pcd, _ = part_geoms[0].remove_statistical_outlier(
+                nb_neighbors=OUTLIER_NB_NEIGHBORS,
+                std_ratio=OUTLIER_STD_RATIO
+            )
+
+            part_points = np.asarray(part_pcd.points).astype(np.float32)
+
+            if part_points.shape[0] > 0:
+                part_points = part_points * 1000.0 * scale
+
+                # Center the part point cloud
+                part_pcd_center = part_points.mean(axis=0)
+                part_points_centered = part_points - part_pcd_center
+                logger.info(f"Generated {len(part_points_centered)} points for part '{part}'")
+                logger.info(f"Part point cloud center: {part_pcd_center}")
+                logger.info(f"Part point cloud range: min={part_points_centered.min(axis=0)}, max={part_points_centered.max(axis=0)}")
+            else:
+                logger.warning(f"Part '{part}' segmentation resulted in empty point cloud")
+
+            # Log overlay path if available
+            if "overlay" in part_results["paths"] and part_results["paths"]["overlay"]:
+                logger.info(f"Part segmentation overlay saved to: {part_results['paths']['overlay']}")
+        else:
+            logger.warning(f"Part '{part}' not detected in image. Try lowering confidence_threshold or checking the part name.")
+
+    return object_points_centered, part_points_centered
 
 
 def convert_transformation_matrix_to_qt(transformation_matrix: np.ndarray) -> np.ndarray:
@@ -291,6 +373,7 @@ class DexDiffuserInference:
         Returns:
             grasp_qt: Grasp poses in [qw, qx, qy, qz, x, y, z, joint_angles] format
             scores: Confidence scores for each grasp
+            outputs_viz: Raw 25-dim outputs for visualization (denormalized joint angles)
         """
         obj_pcd_torch = torch.from_numpy(obj_pcd).unsqueeze(0).repeat(num_samples, 1, 1).to(self.device)
 
@@ -329,7 +412,7 @@ class DexDiffuserInference:
         qt = convert_transformation_matrix_to_qt(rot_mat)
         grasp_qt = np.concatenate([qt, outputs[:, 9:].numpy()], axis=1)
 
-        return grasp_qt, scores
+        return grasp_qt, scores, outputs
 
     def visualize(self, obj_pcd: np.ndarray, grasp_output: torch.Tensor,
                   robot: str = 'allegro_right', save_path: str = None, show: bool = True):
@@ -405,6 +488,8 @@ Examples:
                              help="Path to the camera intrinsics matrix (.npy, 3x3)")
     input_group.add_argument("--target_object", type=str, default=None,
                              help="Language instruction for semantic segmentation (e.g., 'bear', 'cup')")
+    input_group.add_argument("--part", type=str, default=None,
+                             help="Optional part of the object to segment separately (e.g., 'bottle cap'). Only used with image input.")
     input_group.add_argument("--confidence_threshold", type=float, default=0.1,
                              help="Detection confidence threshold for segmentation")
 
@@ -454,6 +539,7 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate point cloud based on input type
+    part_pcd = None  # Initialize part point cloud
     if args.mesh_path is not None:
         # Mesh-based input
         input_name = Path(args.mesh_path).stem
@@ -463,74 +549,57 @@ Examples:
         # Image-based input (RGB-D + semantic segmentation)
         input_name = Path(args.image_path).stem
         logger.info(f"Using image input: {args.image_path}")
-        obj_pcd = image_to_pointcloud(
+        obj_pcd, part_pcd = image_to_pointcloud(
             image_path=args.image_path,
             depth_path=args.depth_path,
             camera_intrinsics_path=args.camera_intrinsics,
             target_object=args.target_object,
             confidence_threshold=args.confidence_threshold,
             output_dir=str(output_dir),
-            scale=args.scale
+            scale=args.scale,
+            part=args.part
         )
+
+        # Log part point cloud status
+        if args.part is not None:
+            if part_pcd is not None:
+                logger.info(f"Part '{args.part}' point cloud generated successfully ({len(part_pcd)} points)")
+                logger.info("Part point cloud is available for future grasp filtering (not implemented yet)")
+            else:
+                logger.warning(f"Part '{args.part}' point cloud could not be generated")
 
     # Initialize model and run inference
     model = DexDiffuserInference(config_dir=args.config_dir, device=args.device)
-    grasp_qt, scores = model.sample_grasps(obj_pcd, num_samples=args.num_samples)
+    grasp_qt, scores, outputs_viz = model.sample_grasps(obj_pcd, num_samples=args.num_samples)
 
     # Sort by score
-    sorted_indices = np.argsort(scores)[::-1]
+    sorted_indices = np.argsort(scores)[::-1].copy()  # copy() to avoid negative stride issues
     grasp_qt_sorted = grasp_qt[sorted_indices]
     scores_sorted = scores[sorted_indices]
+    outputs_viz_sorted = outputs_viz[sorted_indices]
 
     # Print all grasp scores
     logger.info(f"\nAll {len(scores_sorted)} grasps sorted by score:")
     for i in range(len(scores_sorted)):
         logger.info(f"  Grasp {i+1}: score = {scores_sorted[i]:.4f}")
 
-    # Reconstruct grasp output for visualization (need the original 25-dim format)
-    # Re-run to get the raw output for visualization
-    obj_pcd_torch = torch.from_numpy(obj_pcd).unsqueeze(0).to(args.device)
-    data = {
-        'x': torch.randn(args.num_samples, 25, device=args.device),
-        'pos': obj_pcd_torch.repeat(args.num_samples, 1, 1),
-    }
-    data['obj_bps'] = model.bps.encode(data['pos'], feature_type=['dists'])['dists']
-
-    outputs = model.model.sample(data, k=1, guid_param=model.guid_param).squeeze(1)[:, -1, :]
-
-    if model.refinement:
-        data['x_t'] = outputs.detach()
-        outputs_np, _ = model.refineNN.improve_grasps_sampling_based(
-            data, num_refine_steps=100, delta_translation=0.001
-        )
-        outputs = torch.from_numpy(outputs_np).to(args.device).to(torch.float32)
-
-    # Evaluate and sort
-    data['x_t'] = outputs
-    eval_scores = model.evaluator(data)['p_success'].detach().cpu().numpy().squeeze()
-    sorted_viz_indices = np.argsort(eval_scores)[::-1]
-
-    # Denormalize for visualization
-    outputs[:, 9:] = angle_denormalize(joint_angle=outputs[:, 9:])
-    outputs = outputs.float().detach().cpu()
-
-    # Save visualization for all samples
+    # Save visualization for all samples using the same outputs from inference
     if args.save_viz or args.show_viz:
         viz_dir = output_dir / f"{input_name}_visualizations"
         viz_dir.mkdir(parents=True, exist_ok=True)
 
-        for rank, idx in enumerate(sorted_viz_indices):
-            score = eval_scores[idx]
+        for rank in range(len(scores_sorted)):
+            score = scores_sorted[rank]
             viz_path = viz_dir / f"grasp_{rank+1:03d}_score_{score:.4f}.html" if args.save_viz else None
             # Only show interactive window for the best grasp
             show_this = args.show_viz and (rank == 0)
             model.visualize(
                 obj_pcd,
-                outputs[idx:idx+1],
+                outputs_viz_sorted[rank:rank+1],
                 save_path=str(viz_path) if viz_path else None,
                 show=show_this
             )
-        logger.info(f"Saved {len(sorted_viz_indices)} visualizations to: {viz_dir}")
+        logger.info(f"Saved {len(scores_sorted)} visualizations to: {viz_dir}")
 
     logger.info("Inference complete!")
     return grasp_qt_sorted, scores_sorted
